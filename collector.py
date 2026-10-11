@@ -71,7 +71,21 @@ def store_minute_candle(client, symbol, timestamp_ms, price):
 
 
 def fetch_historical_candles(client, symbol, lookback_days=7):
-    """Best-effort historical candles via Finnhub REST; live collection continues if unavailable."""
+    """Best-effort historical candles via Finnhub REST; live collection continues if unavailable.
+
+    Permission denials are cached for 24 hours per symbol so restarts do not repeatedly
+    hit an endpoint the current account cannot access. Live tick collection is unaffected.
+    """
+    blocked_until_key = f"history:blocked_until:{symbol}"
+    try:
+        blocked_until = float(client.get(blocked_until_key) or 0)
+    except (TypeError, ValueError):
+        blocked_until = 0
+    if blocked_until > time.time():
+        remaining_hours = max(1, int((blocked_until - time.time()) // 3600))
+        client.set(f"history:status:{symbol}", "permission_denied_cached", ex=86400)
+        log.info("Skipping historical request for %s: prior access denial cached (retry in about %sh)", symbol, remaining_hours)
+        return 0
     if not FINNHUB_KEY:
         log.warning("Historical candles skipped for %s: FINNHUB_KEY is not configured", symbol)
         return 0
@@ -100,7 +114,17 @@ def fetch_historical_candles(client, symbol, lookback_days=7):
             # Finnhub often returns an explanatory error field when a symbol or
             # endpoint is not available on the current account plan.
             detail = payload.get("error") or payload.get("s") or "unknown response"
-            log.warning("Finnhub history rejected for %s: %s", symbol, str(detail)[:220])
+            if "access" in str(detail).lower() and "resource" in str(detail).lower():
+                client.set(blocked_until_key, str(time.time() + 86400), ex=86400)
+                client.set(f"history:status:{symbol}", "permission_denied", ex=86400)
+                log.warning(
+                    "Historical candles unavailable for %s: Finnhub denied endpoint access. "
+                    "Live collection will continue; retrying history after the 24-hour cache expires.",
+                    symbol,
+                )
+            else:
+                client.set(f"history:status:{symbol}", "no_historical_data", ex=3600)
+                log.warning("Finnhub history rejected for %s: %s", symbol, str(detail)[:220])
             return 0
         rows = []
         for i, epoch in enumerate(payload.get("t", [])):
@@ -133,6 +157,8 @@ def fetch_historical_candles(client, symbol, lookback_days=7):
             if merged:
                 pipe.rpush(key, *[json.dumps(row) for row in merged])
             pipe.execute()
+        client.set(f"history:status:{symbol}", f"loaded:{len(rows)}", ex=86400)
+        client.delete(blocked_until_key)
         log.info("Loaded %s historical 1-minute candles for %s", len(rows), symbol)
         return len(rows)
     except urllib.error.HTTPError as exc:
@@ -142,15 +168,32 @@ def fetch_historical_candles(client, symbol, lookback_days=7):
             detail = exc.read(300).decode("utf-8", errors="replace").replace("\\n", " ")
         except Exception:
             detail = ""
-        log.warning("Historical request for %s failed with HTTP %s: %s",
-                    symbol, exc.code, detail[:220] or "no response detail")
+        if exc.code in (401, 403):
+            # Finnhub access denials are usually account/endpoint permissions, not
+            # transient networking failures. Cache the denial for 24 hours.
+            client.set(blocked_until_key, str(time.time() + 86400), ex=86400)
+            client.set(f"history:status:{symbol}", "permission_denied", ex=86400)
+            log.warning(
+                "Historical candles unavailable for %s (HTTP %s: account/endpoint access denied). "
+                "Live collection will continue; retrying history after the 24-hour cache expires.",
+                symbol, exc.code,
+            )
+        else:
+            client.set(f"history:status:{symbol}", f"http_error:{exc.code}", ex=3600)
+            log.warning("Historical request for %s failed with HTTP %s: %s",
+                        symbol, exc.code, detail[:220] or "no response detail")
         return 0
     except urllib.error.URLError as exc:
+        client.set(f"history:status:{symbol}", "network_error", ex=300)
         log.warning("Historical request for %s could not reach Finnhub: %s",
                     symbol, str(getattr(exc, "reason", "network error"))[:180])
         return 0
     except Exception as exc:
         # Do not log request URLs, which contain the API token.
+        try:
+            client.set(f"history:status:{symbol}", "request_error", ex=300)
+        except Exception:
+            pass
         log.warning("Could not load historical candles for %s: %s", symbol, type(exc).__name__)
         log.debug("Historical candle failure details", exc_info=True)
         return 0
