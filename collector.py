@@ -204,7 +204,10 @@ class RealisticPortfolio:
                 return
             dt = utc_timestamp(timestamp)
             if decision == "BUY" and symbol not in self.positions:
-                if symbol in stale or not (math.isfinite(current_atr) and current_atr > 0):
+                if (symbol in stale
+                        or not isinstance(current_atr, (int, float))
+                        or not math.isfinite(current_atr)
+                        or current_atr <= 0):
                     log.warning("Rejecting BUY for %s: stale data or invalid ATR", symbol)
                     return
                 risk_per_share = max(current_atr * self.atr_multiplier, price * 0.01)
