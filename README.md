@@ -4,10 +4,10 @@ A **simulation-only** market-data and paper-trading prototype. It does not conne
 
 ## Components
 
-- `app.py` — read-only Streamlit dashboard for charts, simulated portfolio state, and local audit records.
+- `app.py` — read-only Streamlit dashboard for charts, simulated portfolio state, local audit records, and a searchable PDF learning library.
 - `collector.py` — separate Finnhub WebSocket collector and simulated portfolio engine.
 - `test_trading_bot.py` — unit tests for the trading logic.
-- `requirements.txt` — Python dependencies.
+- `requirements.txt` — Python dependencies, including PyMuPDF for PDF text extraction and page previews.
 
 The dashboard and collector are separate processes. Streamlit Community Cloud runs the selected Streamlit entrypoint; it does **not** automatically run `collector.py` as a second service.
 
@@ -72,3 +72,15 @@ pytest -q
 ```
 
 A successful deployment build only verifies that the app can start; it does not prove that the collector, feed, strategy, or simulated performance is correct.
+
+## PDF learning library
+
+The dashboard includes a **PDF learning library** tab. Upload a PDF (up to 25 MB and 200 pages), parse it, preview pages containing trading charts/diagrams, and search extracted text excerpts. Extracted excerpts and document metadata are stored in Redis so the dashboard can retrieve them later.
+
+- Text-based PDFs can be searched immediately.
+- Chart-heavy pages are rendered as images for visual inspection.
+- Scanned/image-only PDFs may have no extractable text; OCR is not implemented yet.
+- The current search is keyword-based retrieval, not AI model training. It does not automatically infer a trading strategy from a chart or guarantee that the material is correct.
+- Redis storage is shared with the dashboard and collector, so monitor your Redis plan's memory limits and only upload material you are allowed to use.
+
+The chart supports touch pinch-to-zoom on compatible mobile browsers, drag-to-pan, toolbar controls, and double-click reset. Gesture behavior can vary slightly by browser/device.
