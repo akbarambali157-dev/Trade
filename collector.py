@@ -359,7 +359,9 @@ def run_collector():
                 client.ltrim(f"ticks:{symbol}", -MAX_TICKS_PER_SYMBOL, -1)
                 owned = symbol in portfolio.positions
                 decision, reason, atr = engine.process_incoming_tick(symbol, float(price), timestamp, owned)
-                if decision != "HOLD" and atr is not None:
+                # Evaluate stop-losses and trail stops on every valid tick, even when
+                # the strategy's entry/exit signal is HOLD.
+                if atr is not None:
                     portfolio.process_signal(symbol, float(price), timestamp, decision, reason, atr, latest_prices)
         except Exception:
             log.exception("Message processing failed")
