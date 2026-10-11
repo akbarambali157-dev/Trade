@@ -111,10 +111,12 @@ def merge_archive(rows, archive_path=ARCHIVE_FILE):
     return len(ordered)
 
 
-def download_history(date_from, date_to, timeframe="m1", archive_path=ARCHIVE_FILE):
+def download_history(date_from, date_to, timeframe="m1", archive_path=None):
     """Use the maintained CLI interface to fetch history, then validate and archive it."""
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe {timeframe!r}; choose from {sorted(SUPPORTED_TIMEFRAMES)}")
+    if archive_path is None:
+        archive_path = default_archive_file(timeframe)
     start = datetime.strptime(date_from, "%Y-%m-%d").date()
     end = datetime.strptime(date_to, "%Y-%m-%d").date()
     if end <= start:
