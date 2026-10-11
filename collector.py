@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import redis
 import websocket
 from brain import MeridianBrain
+from candle_storage import persist_completed_minute
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -61,6 +62,11 @@ def store_minute_candle(client, symbol, timestamp_ms, price):
         if current and current.get("timestamp"):
             client.rpush(history_key, json.dumps(current))
             client.ltrim(history_key, -MAX_CANDLES_PER_SYMBOL, -1)
+            try:
+                persist_completed_minute(client, symbol, current, db_path=DB_NAME)
+            except Exception:
+                # Keep live collection resilient; persistence failures are surfaced in logs.
+                log.exception("Could not persist completed candle for %s", symbol)
         current = {
             "timestamp": minute_stamp,
             "open": float(price),
