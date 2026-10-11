@@ -472,9 +472,120 @@ def live_chart(symbol, candle_interval):
         st.error("Could not render the chart. Check the saved candle data and Redis connection.")
 
 
-tab1, tab2, tab3 = st.tabs(["Live charts & portfolio", "Audit trail & analytics", "PDF learning library"])
+# Streamlit's collapsed sidebar becomes the three-bar navigation menu.
+st.markdown("""
+<style>
+:root { color-scheme: dark; }
+.stApp { background: radial-gradient(ellipse at 10% 0%, #12212b 0%, #0a0f14 44%, #080b10 100%); }
+.block-container { max-width: 1500px; padding-top: 2rem; padding-bottom: 3rem; }
+[data-testid="stSidebar"] { background: #0b1219; border-right: 1px solid #23313b; }
+[data-testid="stMetric"] { background: #111b24; border: 1px solid #263743; padding: 14px 16px; border-radius: 14px; }
+div[data-testid="stVerticalBlockBorderWrapper"] { border-color: #253642; border-radius: 16px; background: rgba(17,27,36,.72); }
+.hero-panel { padding: 28px; border-radius: 20px; border: 1px solid #2a414d; background: linear-gradient(120deg, rgba(23,54,66,.92), rgba(13,20,29,.96)); }
+.eyebrow { color: #61e2d2; letter-spacing: .16em; font-size: .75rem; font-weight: 700; }
+.hero-title { font-size: clamp(2rem, 4vw, 3.4rem); line-height: 1.08; font-weight: 750; margin: .5rem 0; }
+.muted { color: #9aabb8; }
+</style>
+""", unsafe_allow_html=True)
 
-with tab1:
+with st.sidebar:
+    st.markdown("## ◈ MERIDIAN")
+    st.caption("PAPER TRADING WORKSPACE")
+    page = st.radio(
+        "Workspace",
+        ["Home", "Charts", "Markets", "Knowledge library", "Bot workbench", "Portfolio & history"],
+        label_visibility="collapsed",
+        key="workspace_page",
+    )
+    st.divider()
+    st.markdown("**SUPPORTED MARKETS**")
+    st.caption("₿  BTC / USDT · 24/7")
+    st.caption("◉  XAU / USD · Gold · chart only")
+    st.caption("AAPL · MSFT · TSLA · NVDA")
+    st.divider()
+    st.caption("SIMULATION ONLY")
+    st.caption("No brokerage orders or real money.")
+
+if page == "Home":
+    st.markdown('<div class="hero-panel"><div class="eyebrow">YOUR MARKET RESEARCH SPACE</div><div class="hero-title">Good to see you.<br>Let’s study the markets.</div><p class="muted">Track live feeds, explore price action, build a searchable trading knowledge library, and test a rules-based bot in a paper environment.</p></div>', unsafe_allow_html=True)
+    st.write("")
+    prices, ages = load_prices()
+    saved_ids = r.smembers("knowledge:pdf_ids")
+    cash, positions = None, None
+    try:
+        cash, positions = load_portfolio()
+    except Exception:
+        pass
+    a, b, c = st.columns(3)
+    a.metric("Knowledge documents", len(saved_ids))
+    a.metric("Paper positions", len(positions) if positions is not None else "Waiting")
+    a.metric("BTC / USDT", f"${prices['BINANCE:BTCUSDT']:,.2f}" if "BINANCE:BTCUSDT" in prices else "Waiting for feed")
+    st.write("")
+    left, right = st.columns([1.2, 0.8], gap="large")
+    with left:
+        st.markdown("### Add a PDF to your knowledge base")
+        st.caption("Upload trading notes, strategy guides, or chart reference PDFs. Text is indexed for search; this does not train an AI model.")
+        home_pdf = st.file_uploader("Choose a PDF", type=["pdf"], key="home_pdf_upload", help="Maximum 25 MB and 200 pages.")
+        if home_pdf is not None:
+            if len(home_pdf.getvalue()) > 25 * 1024 * 1024:
+                st.error("This PDF is larger than 25 MB.")
+            elif st.button("Add PDF to knowledge library", type="primary", key="home_parse_pdf"):
+                try:
+                    data = home_pdf.getvalue()
+                    digest = hashlib.sha256(data).hexdigest()
+                    with fitz.open(stream=data, filetype="pdf") as pdf:
+                        if len(pdf) > 200:
+                            st.error("This PDF has more than 200 pages. Split it into smaller files.")
+                        else:
+                            chunks, chars = [], 0
+                            for page_no, pdf_page in enumerate(pdf, start=1):
+                                page_text = pdf_page.get_text("text").strip()
+                                chars += len(page_text)
+                                for start in range(0, len(page_text), 1200):
+                                    excerpt = page_text[max(0, start - 120):start + 1200].strip()
+                                    if excerpt:
+                                        chunks.append({"page": page_no, "text": excerpt})
+                            doc = {"filename": home_pdf.name, "sha256": digest, "pages": len(pdf), "text_chars": chars, "chunks": chunks[:3000], "saved_at": int(time.time())}
+                            r.set(f"knowledge:pdf:{digest}", json.dumps(doc, ensure_ascii=False))
+                            r.sadd("knowledge:pdf_ids", digest)
+                            st.success(f"Added {home_pdf.name} to your library.")
+                            if chars == 0:
+                                st.warning("No selectable text found; this may be a scanned PDF. OCR is not enabled yet.")
+                except Exception:
+                    st.error("Could not parse the PDF. Try an unlocked, undamaged PDF.")
+    with right:
+        st.markdown("### Workspace shortcuts")
+        with st.container(border=True):
+            st.markdown("**01 · Charts & price action**")
+            st.caption("Candles, timeframes, and market feed status.")
+            if st.button("Open charts →", use_container_width=True):
+                st.session_state["workspace_page"] = "Charts"
+                st.rerun()
+        with st.container(border=True):
+            st.markdown("**02 · Knowledge library**")
+            st.caption("Search excerpts and review uploaded references.")
+            if st.button("Explore knowledge →", use_container_width=True):
+                st.session_state["workspace_page"] = "Knowledge library"
+                st.rerun()
+        with st.container(border=True):
+            st.markdown("**03 · Bot workbench**")
+            st.caption("Inspect the paper strategy and its safety controls.")
+            if st.button("Open bot workbench →", use_container_width=True):
+                st.session_state["workspace_page"] = "Bot workbench"
+                st.rerun()
+    st.write("")
+    st.markdown("### Market pulse")
+    pulse = st.columns(3)
+    for col, symbol, label in zip(pulse, ["BINANCE:BTCUSDT", "OANDA:XAU_USD", "AAPL"], ["BTC / USDT", "XAU / USD · Gold", "AAPL"]):
+        with col:
+            with st.container(border=True):
+                value = prices.get(symbol)
+                st.metric(label, f"${value:,.2f}" if value is not None else "Waiting…")
+                status, detail = market_status(symbol)
+                st.caption(f"{status} · {detail}")
+                st.caption(_age_label(ages.get(symbol)))
+
+elif page == "Charts":
     connection_panel()
     selected_symbol = st.session_state.get("selected_market", WATCHLIST[0])
     selected_label = {
@@ -519,7 +630,7 @@ with tab1:
     st.subheader("Portfolio")
     portfolio_panel()
 
-with tab2:
+elif page == "Portfolio & history":
     st.subheader("Completed simulated trades")
     try:
         trades = load_trades()
@@ -549,7 +660,7 @@ with tab2:
         st.error(f"Could not load the audit database: {exc}")
 
 
-with tab3:
+elif page == "Knowledge library":
     st.subheader("PDF learning library")
     st.caption(
         "Upload trading guides, notes, or chart-heavy PDFs. The app extracts selectable text, "
@@ -693,6 +804,58 @@ with tab3:
                         continue
     except Exception:
         st.warning("The PDF library could not be read from Redis. Check the Redis connection and available memory.")
+
+
+elif page == "Markets":
+    st.markdown("## Supported markets")
+    st.caption("Prices are provided by the collector. Scheduled session labels are estimates, not an exchange holiday calendar.")
+    prices, ages = load_prices()
+    for symbol in WATCHLIST:
+        label = {"BINANCE:BTCUSDT":"BTC / USDT", "OANDA:XAU_USD":"XAU / USD · Gold"}.get(symbol, symbol)
+        status, detail = market_status(symbol)
+        with st.container(border=True):
+            cols = st.columns([1.3, 1, 1.3, 1])
+            cols[0].markdown(f"**{label}**")
+            cols[1].metric("Latest price", f"${prices[symbol]:,.4f}" if symbol in prices else "Waiting…")
+            cols[2].markdown(f"**{status}**")
+            cols[2].caption(detail)
+            cols[3].caption(_age_label(ages.get(symbol)))
+            if symbol == "OANDA:XAU_USD":
+                st.caption("Gold is currently chart-only; the bot does not open gold positions.")
+            elif symbol in ["AAPL", "MSFT", "TSLA", "NVDA", "BINANCE:BTCUSDT"]:
+                st.caption("Eligible for the existing paper strategy when enabled and when valid signals/data are available.")
+
+elif page == "Bot workbench":
+    st.markdown("## Bot workbench")
+    st.caption("A controlled workspace for the existing rules-based paper-trading engine—not a real brokerage bot.")
+    enabled_raw = r.get("bot:paper_enabled")
+    bot_enabled = enabled_raw != "false"
+    status_cols = st.columns(3)
+    status_cols[0].metric("Paper engine", "Enabled" if bot_enabled else "Paused")
+    status_cols[1].metric("Execution mode", "Paper only")
+    status_cols[2].metric("Gold trading", "Disabled")
+    st.warning("This switch controls new strategy entries in collector.py. Protective stop checks should continue even while entries are paused. It never enables real-money orders.")
+    toggle = st.toggle("Allow new simulated entries", value=bot_enabled, key="paper_bot_toggle")
+    if toggle != bot_enabled:
+        r.set("bot:paper_enabled", "true" if toggle else "false")
+        st.success("Paper bot setting saved. The collector reads this setting while processing incoming ticks.")
+        st.rerun()
+    st.markdown("### Current strategy framework")
+    with st.container(border=True):
+        st.markdown("**Signal layer**")
+        st.write("Completed 1-minute candles → SMA trend reference + RSI oversold check → ATR volatility estimate → BUY / SELL / HOLD decision.")
+        st.markdown("**Risk layer**")
+        st.write("Position sizing targets 1% of estimated equity risk per trade; aggregate open downside risk is capped at 3%; an ATR-based protective stop and trailing stop are used; commissions are simulated.")
+        st.markdown("**Execution and audit layer**")
+        st.write("Signals are processed by the background collector, portfolio state is stored in Redis, and trade audit events are written to SQLite on the collector machine.")
+    st.info("The engine already evaluates incoming ticks automatically. The dashboard does not create an additional trading loop. The strategy has not been validated and its simulated performance is not a forecast.")
+    st.markdown("### Bot health")
+    h1, h2, h3 = st.columns(3)
+    h1.metric("Collector", r.get("health:collector:status") or "Unknown")
+    h2.metric("Market feed", r.get("health:finnhub:status") or "Unknown")
+    h3.metric("Last bot decision", r.get("bot:last_decision") or "Not published yet")
+    st.caption("Next development milestones: publish per-symbol decisions/indicator values, add replay/backtesting on historical candles, then evaluate out-of-sample paper results before considering any strategy changes.")
+
 
 st.caption(
     "Market data and paper-trading state are supplied by collector.py, which must "
