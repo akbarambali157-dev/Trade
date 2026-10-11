@@ -367,7 +367,7 @@ def live_chart(symbol, candle_interval):
             dragmode="pan",
             uirevision=f"{symbol}-{candle_interval}",
             xaxis=dict(fixedrange=False, showgrid=True, rangeslider=dict(visible=False)),
-            yaxis=dict(fixedrange=False, side="right", fixedrange=False),
+            yaxis=dict(side="right", fixedrange=False),
             hovermode="x unified",
         )
         st.caption("On touchscreens, pinch with two fingers to zoom; spread fingers to zoom out. Drag to pan. Use the chart toolbar to reset the view.")
