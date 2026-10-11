@@ -18,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA"]
+WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA", "BINANCE:BTCUSDT"]
 
 
 def setting(name, default=None):
@@ -126,6 +126,104 @@ def load_prices():
             except (ValueError, TypeError):
                 pass
     return prices, ages
+
+
+def _age_label(age):
+    if age is None:
+        return "No data received yet"
+    if age < 60:
+        return f"Last update {int(age)}s ago"
+    if age < 3600:
+        return f"Last update {int(age // 60)}m ago"
+    return f"Last update {int(age // 3600)}h ago"
+
+
+@st.fragment(run_every=3)
+def connection_panel():
+    """Show the data path and live health of the collector connection."""
+    now = time.time()
+    try:
+        redis_ok = bool(r.ping())
+    except Exception:
+        redis_ok = False
+
+    heartbeat_raw = r.get("health:collector:heartbeat")
+    try:
+        collector_age = max(0.0, now - float(heartbeat_raw)) if heartbeat_raw else None
+    except (TypeError, ValueError):
+        collector_age = None
+    collector_ok = collector_age is not None and collector_age <= 35
+
+    finnhub_state = r.get("health:finnhub:status") or "unknown"
+    message_raw = r.get("health:finnhub:last_message")
+    try:
+        message_age = max(0.0, now - float(message_raw)) if message_raw else None
+    except (TypeError, ValueError):
+        message_age = None
+
+    st.subheader("Connection topology")
+    st.caption("Live data path: Finnhub → collector on your computer → Upstash Redis → this dashboard.")
+    c1, a1, c2, a2, c3, a3, c4 = st.columns([1, 0.22, 1, 0.22, 1, 0.22, 1])
+    with c1:
+        with st.container(border=True):
+            st.markdown("**01 · FINNHUB**")
+            if finnhub_state == "connected":
+                st.success("WebSocket connected")
+            elif finnhub_state == "error":
+                st.error("Feed error")
+            elif finnhub_state == "disconnected":
+                st.warning("Disconnected")
+            elif finnhub_state == "connecting":
+                st.info("Connecting…")
+            else:
+                st.warning("Not reporting yet")
+            st.caption(_age_label(message_age))
+    with a1:
+        st.markdown("<div style='text-align:center;padding-top:2rem;font-size:1.5rem'>→</div>", unsafe_allow_html=True)
+    with c2:
+        with st.container(border=True):
+            st.markdown("**02 · COLLECTOR**")
+            if collector_ok:
+                st.success("Worker online")
+            elif collector_age is None:
+                st.warning("No heartbeat")
+            else:
+                st.error("Heartbeat stale")
+            st.caption(_age_label(collector_age))
+    with a2:
+        st.markdown("<div style='text-align:center;padding-top:2rem;font-size:1.5rem'>→</div>", unsafe_allow_html=True)
+    with c3:
+        with st.container(border=True):
+            st.markdown("**03 · UPSTASH REDIS**")
+            if redis_ok:
+                st.success("Database reachable")
+            else:
+                st.error("Database unavailable")
+            st.caption("Shared state + tick stream")
+    with a3:
+        st.markdown("<div style='text-align:center;padding-top:2rem;font-size:1.5rem'>→</div>", unsafe_allow_html=True)
+    with c4:
+        with st.container(border=True):
+            st.markdown("**04 · STREAMLIT UI**")
+            st.success("Dashboard online")
+            st.caption("Refreshing every 3 seconds")
+
+    prices, ages = load_prices()
+    st.subheader("Live market pulse")
+    cards = st.columns(len(WATCHLIST))
+    for col, symbol in zip(cards, WATCHLIST):
+        label = "BTC / USDT · Binance" if symbol == "BINANCE:BTCUSDT" else symbol
+        with col:
+            price = prices.get(symbol)
+            st.metric(label, f"${price:,.2f}" if price is not None else "Waiting…")
+            age = ages.get(symbol)
+            st.caption(_age_label(age))
+            if age is None:
+                st.warning("No tick yet")
+            elif age > STALE_WARNING_SECONDS:
+                st.warning("Feed may be stale")
+            else:
+                st.success("Receiving ticks")
 
 
 def load_trades():
@@ -265,7 +363,12 @@ def live_chart(symbol):
 tab1, tab2 = st.tabs(["Live charts & portfolio", "Audit trail & analytics"])
 
 with tab1:
-    selected_symbol = st.selectbox("Watchlist symbol", WATCHLIST)
+    connection_panel()
+    selected_symbol = st.selectbox(
+        "Watchlist symbol",
+        WATCHLIST,
+        format_func=lambda symbol: "BTC / USDT · Binance" if symbol == "BINANCE:BTCUSDT" else symbol,
+    )
     try:
         health = r.get(f"health:last_tick:{selected_symbol}")
         if health is None:
