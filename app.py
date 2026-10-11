@@ -1,28 +1,85 @@
-"""Read-only Streamlit dashboard for the background paper-trading collector."""
+"""Read-only Streamlit dashboard for the separate paper-trading collector."""
 import json
+import math
 import os
 import sqlite3
 import time
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 import redis
 import streamlit as st
 
-st.set_page_config(page_title="Quant Trading Dashboard", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Quant Trading Dashboard",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA"]
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-DB_NAME = os.getenv("TRADING_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "trading_bot.db"))
+
+
+def setting(name, default=None):
+    """Read configuration from environment variables or Streamlit secrets."""
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        value = st.secrets.get(name, default)
+        return value if value not in ("", None) else default
+    except Exception:
+        # Local runs and first-time cloud deploys may not have secrets configured.
+        return default
+
+
+REDIS_URL = setting("REDIS_URL")
+DB_NAME = setting(
+    "TRADING_DB_PATH",
+    str(Path(__file__).resolve().parent / "trading_bot.db"),
+)
+REDIS_CONNECT_TIMEOUT = 3.0
+STALE_WARNING_SECONDS = 60
+STALE_POSITION_SECONDS = 120
 
 st.title("Quant Trading Dashboard")
-st.caption("Paper trading only — this dashboard does not place real brokerage orders.")
+st.caption(
+    "SIMULATION ONLY · This read-only dashboard does not place brokerage orders "
+    "or use real money."
+)
+
+if not REDIS_URL:
+    st.warning("Redis is not configured yet.")
+    st.markdown(
+        "To connect the dashboard, add a reachable Redis URL in your Streamlit "
+        "app's **Settings → Secrets**. Do not commit credentials to GitHub."
+    )
+    st.code('REDIS_URL = "rediss://<username>:<password>@<host>:<port>"', language="toml")
+    st.info(
+        "The market-data collector must run separately and publish ticks and "
+        "portfolio state to the same Redis instance. Streamlit Community Cloud "
+        "does not start collector.py automatically."
+    )
+    st.stop()
 
 try:
-    r = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=3.0)
+    r = redis.from_url(
+        REDIS_URL,
+        decode_responses=True,
+        socket_connect_timeout=REDIS_CONNECT_TIMEOUT,
+        socket_timeout=REDIS_CONNECT_TIMEOUT,
+        health_check_interval=30,
+    )
     r.ping()
-except Exception as exc:
-    st.error(f"Redis is unavailable. Start Redis and the collector, then refresh. Details: {exc}")
+except Exception:
+    # Avoid displaying the exception because connection errors can contain host
+    # details or credentials embedded in the configured URL.
+    st.error(
+        "Redis could not be reached. Check the REDIS_URL secret, Redis service "
+        "status, network access, and whether the collector and dashboard use "
+        "the same Redis instance."
+    )
     st.stop()
 
 
@@ -32,11 +89,18 @@ def load_portfolio():
     if cash_raw is None and positions_raw is None:
         return None, None
     if cash_raw is None or positions_raw is None:
-        raise ValueError("Portfolio state is incomplete.")
+        raise ValueError("Portfolio state is incomplete; check the collector logs.")
     cash = float(cash_raw)
     positions = json.loads(positions_raw)
-    if not isinstance(positions, dict):
-        raise ValueError("Portfolio positions are invalid.")
+    if not math.isfinite(cash) or cash < 0 or not isinstance(positions, dict):
+        raise ValueError("Portfolio state contains invalid cash or positions.")
+    for symbol, pos in positions.items():
+        if not isinstance(pos, dict):
+            raise ValueError(f"Invalid position data for {symbol}.")
+        for field in ("shares", "entry_price", "atr_stop"):
+            value = float(pos[field])
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"Invalid {field} value for {symbol}.")
     return cash, positions
 
 
@@ -46,21 +110,48 @@ def load_prices():
         raw = r.lrange(f"ticks:{symbol}", -1, -1)
         health = r.get(f"health:last_tick:{symbol}")
         if raw:
-            tick = json.loads(raw[0])
-            price = float(tick["price"])
-            if price > 0:
-                prices[symbol] = price
+            try:
+                tick = json.loads(raw[0])
+                price = float(tick["price"])
+                if math.isfinite(price) and price > 0:
+                    prices[symbol] = price
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                # Ignore a malformed latest tick rather than breaking the dashboard.
+                pass
         if health:
-            ages[symbol] = max(0.0, time.time() - float(health))
+            try:
+                received_at = float(health)
+                if math.isfinite(received_at) and received_at > 0:
+                    ages[symbol] = max(0.0, time.time() - received_at)
+            except (ValueError, TypeError):
+                pass
     return prices, ages
 
 
 def load_trades():
+    """Read local SQLite audit records, if this deployment has access to them."""
     if not os.path.exists(DB_NAME):
-        return pd.DataFrame(columns=["timestamp", "symbol", "action", "price", "shares", "pnl_usd", "pnl_pct", "reason"])
+        return pd.DataFrame(
+            columns=[
+                "timestamp", "symbol", "action", "price", "shares",
+                "pnl_usd", "pnl_pct", "reason",
+            ]
+        )
     with sqlite3.connect(DB_NAME, timeout=5) as conn:
+        conn.execute("PRAGMA busy_timeout=5000")
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trades'"
+        ).fetchone()
+        if table is None:
+            return pd.DataFrame(
+                columns=[
+                    "timestamp", "symbol", "action", "price", "shares",
+                    "pnl_usd", "pnl_pct", "reason",
+                ]
+            )
         return pd.read_sql_query(
-            "SELECT timestamp, symbol, action, price, shares, pnl_usd, pnl_pct, reason FROM trades ORDER BY id DESC",
+            "SELECT timestamp, symbol, action, price, shares, pnl_usd, pnl_pct, reason "
+            "FROM trades ORDER BY id DESC",
             conn,
         )
 
@@ -73,16 +164,29 @@ def portfolio_panel():
         if cash is None:
             st.info("Waiting for the collector to initialize the simulated portfolio.")
             return
+
         equity = cash
         for symbol, pos in positions.items():
-            equity += float(pos["shares"]) * prices.get(symbol, float(pos["entry_price"]))
-        stale = [s for s in positions if ages.get(s, float("inf")) > 120 or s not in prices]
+            equity += float(pos["shares"]) * prices.get(
+                symbol, float(pos["entry_price"])
+            )
+
+        stale = [
+            symbol for symbol in positions
+            if ages.get(symbol, math.inf) > STALE_POSITION_SECONDS
+            or symbol not in prices
+        ]
         c1, c2, c3 = st.columns(3)
         c1.metric("Estimated portfolio equity", f"${equity:,.2f}")
         c2.metric("Available cash", f"${cash:,.2f}")
         c3.metric("Open positions", str(len(positions)))
+
         if stale:
-            st.warning("Stale or missing market prices for open positions: " + ", ".join(stale))
+            st.warning(
+                "Prices are stale or missing for open positions: "
+                + ", ".join(stale)
+                + ". Equity uses entry prices for those symbols."
+            )
         if positions:
             rows = []
             for symbol, pos in positions.items():
@@ -91,11 +195,13 @@ def portfolio_panel():
                     "Symbol": symbol,
                     "Shares": round(float(pos["shares"]), 4),
                     "Entry price": round(float(pos["entry_price"]), 4),
-                    "Latest price": round(prices.get(symbol, float(pos["entry_price"])), 4),
+                    "Latest price": round(
+                        prices.get(symbol, float(pos["entry_price"])), 4
+                    ),
                     "ATR stop": round(float(pos["atr_stop"]), 4),
                     "Price age (seconds)": round(age, 1) if age is not None else "Unknown",
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         else:
             st.info("No active simulated positions.")
     except Exception as exc:
@@ -109,23 +215,40 @@ def live_chart(symbol):
         if not raw:
             st.info(f"Waiting for market data for {symbol}.")
             return
-        frame = pd.DataFrame([json.loads(item) for item in raw])
+        records = []
+        for item in raw:
+            try:
+                tick = json.loads(item)
+                price = float(tick["price"])
+                if math.isfinite(price) and price > 0:
+                    records.append({"timestamp": tick["timestamp"], "price": price})
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                continue
+        frame = pd.DataFrame(records)
         if frame.empty:
-            st.info(f"No market data recorded for {symbol}.")
+            st.info(f"No valid market ticks are available for {symbol} yet.")
             return
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-        frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
+
+        frame["timestamp"] = pd.to_datetime(
+            frame["timestamp"], utc=True, errors="coerce"
+        )
         frame = frame.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
         if frame.empty:
-            st.info("No valid ticks available yet.")
+            st.info("No valid timestamps are available to chart yet.")
             return
+
         ohlc = frame.set_index("timestamp")["price"].resample("1min").ohlc().dropna()
         if ohlc.empty:
             st.info("Waiting for enough ticks to build candles.")
             return
+
         fig = go.Figure(data=[go.Candlestick(
-            x=ohlc.index, open=ohlc["open"], high=ohlc["high"],
-            low=ohlc["low"], close=ohlc["close"]
+            x=ohlc.index,
+            open=ohlc["open"],
+            high=ohlc["high"],
+            low=ohlc["low"],
+            close=ohlc["close"],
+            name=symbol,
         )])
         fig.update_layout(
             title=f"{symbol} — 1-minute candles",
@@ -136,10 +259,11 @@ def live_chart(symbol):
         )
         st.plotly_chart(fig, use_container_width=True)
     except Exception as exc:
-        st.error(f"Could not render chart: {exc}")
+        st.error(f"Could not render the chart: {exc}")
 
 
 tab1, tab2 = st.tabs(["Live charts & portfolio", "Audit trail & analytics"])
+
 with tab1:
     selected_symbol = st.selectbox("Watchlist symbol", WATCHLIST)
     try:
@@ -147,13 +271,17 @@ with tab1:
         if health is None:
             st.info("Waiting for the collector's first tick.")
         else:
-            age = max(0, time.time() - float(health))
-            if age > 60:
-                st.warning(f"Market feed is stale ({int(age)} seconds since last tick).")
-            else:
-                st.success(f"Market feed recently received data ({int(age)} seconds ago).")
-    except Exception as exc:
-        st.warning(f"Could not read feed health: {exc}")
+            try:
+                age = max(0.0, time.time() - float(health))
+                if age > STALE_WARNING_SECONDS:
+                    st.warning(f"Market feed is stale ({int(age)} seconds since last tick).")
+                else:
+                    st.success(f"Market feed recently received data ({int(age)} seconds ago).")
+            except (ValueError, TypeError):
+                st.warning("The collector's feed-health timestamp is invalid.")
+    except Exception:
+        st.warning("Could not read feed health; check the Redis connection.")
+
     live_chart(selected_symbol)
     st.subheader("Portfolio")
     portfolio_panel()
@@ -163,10 +291,15 @@ with tab2:
     try:
         trades = load_trades()
         if trades.empty:
-            st.info("No completed trade records are available yet.")
+            st.info(
+                "No audit records are visible to this dashboard yet. If the collector "
+                "runs as a separate service, its local SQLite file is not shared with "
+                "Streamlit Community Cloud; use a shared persistent database to share "
+                "audit history between services."
+            )
         else:
             sells = trades[trades["action"] == "SELL"]
-            wins = int((sells["pnl_usd"] > 0).sum())
+            wins = int((pd.to_numeric(sells["pnl_usd"], errors="coerce") > 0).sum())
             rate = (wins / len(sells) * 100) if len(sells) else 0.0
             c1, c2, c3 = st.columns(3)
             c1.metric("Completed trades", len(sells))
@@ -178,6 +311,12 @@ with tab2:
                 file_name="paper_trading_audit.csv",
                 mime="text/csv",
             )
-            st.dataframe(trades.head(100), use_container_width=True)
+            st.dataframe(trades.head(100), use_container_width=True, hide_index=True)
     except Exception as exc:
         st.error(f"Could not load the audit database: {exc}")
+
+st.caption(
+    "Market data and paper-trading state are supplied by collector.py, which must "
+    "run separately. Prices may be delayed or stale; this is a development prototype, "
+    "not a production trading system."
+)
