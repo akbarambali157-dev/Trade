@@ -1,9 +1,9 @@
-streamlit
-pandas
-numpy
-websockets
-python-dotenv
-pypdf
-websocket-client
-plotly
-redis
+streamlit>=1.37,<2
+pandas>=2.0,<4
+plotly>=5.18,<7
+redis>=5,<7
+websocket-client>=1.7,<2
+python-dotenv>=1.0,<2
+
+# Development/test dependency:
+pytest>=8,<9
