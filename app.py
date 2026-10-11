@@ -5,7 +5,9 @@ import math
 import os
 import sqlite3
 import time
+from datetime import datetime, time as dt_time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import fitz
@@ -130,6 +132,34 @@ def load_prices():
     return prices, ages
 
 
+
+def market_status(symbol):
+    """Return scheduled session state; crypto trades continuously, other sessions use ET."""
+    if symbol == "BINANCE:BTCUSDT":
+        return "Open", "Crypto trades 24/7"
+    now = datetime.now(ZoneInfo("America/New_York"))
+    clock = now.time().replace(tzinfo=None)
+    weekday = now.weekday()  # Monday=0, Sunday=6
+
+    if symbol == "OANDA:XAU_USD":
+        # Approximate OANDA spot-gold schedule: Sunday evening through Friday afternoon ET,
+        # with a short daily maintenance break. Broker holidays can differ.
+        if weekday == 5:
+            return "Closed", "Gold session resumes Sunday at about 5:05 PM ET"
+        if weekday == 6 and clock < dt_time(17, 5):
+            return "Closed", "Gold session resumes Sunday at about 5:05 PM ET"
+        if weekday == 4 and clock >= dt_time(16, 59):
+            return "Closed", "Gold session resumes Sunday at about 5:05 PM ET"
+        if dt_time(16, 59) <= clock < dt_time(17, 5):
+            return "Closed", "Daily market maintenance break"
+        return "Open", "Scheduled gold trading session"
+
+    # US-listed equities regular session; exchange holidays are not included in this estimate.
+    if weekday >= 5 or not (dt_time(9, 30) <= clock < dt_time(16, 0)):
+        return "Closed", "Outside regular US stock hours (9:30 AM–4:00 PM ET)"
+    return "Open", "Scheduled regular US stock session"
+
+
 def _age_label(age):
     if age is None:
         return "No data received yet"
@@ -223,13 +253,20 @@ def connection_panel():
                 price = prices.get(symbol)
                 st.metric(label, f"${price:,.2f}" if price is not None else "Waiting…")
                 age = ages.get(symbol)
-                st.caption(_age_label(age))
-                if age is None:
-                    st.caption("No tick yet")
-                elif age > STALE_WARNING_SECONDS:
-                    st.caption("Feed may be stale")
+                session_state, session_detail = market_status(symbol)
+                if session_state == "Closed":
+                    st.warning("Market closed")
+                    st.caption(session_detail)
+                    st.caption(_age_label(age))
                 else:
-                    st.caption("● Live feed")
+                    st.caption(session_detail)
+                    st.caption(_age_label(age))
+                    if age is None:
+                        st.caption("Waiting for first tick")
+                    elif age > STALE_WARNING_SECONDS:
+                        st.caption("Feed may be stale")
+                    else:
+                        st.caption("● Live feed")
                 selected = st.session_state.get("selected_market", WATCHLIST[0]) == symbol
                 button_label = "✓ Chart selected" if selected else "View chart →"
                 if st.button(button_label, key=f"market_{symbol}", use_container_width=True):
@@ -320,35 +357,72 @@ def portfolio_panel():
 @st.fragment(run_every=3)
 def live_chart(symbol, candle_interval):
     try:
-        raw = r.lrange(f"ticks:{symbol}", 0, -1)
-        if not raw:
-            st.info(f"Waiting for market data for {symbol}.")
-            return
-        records = []
-        for item in raw:
+        # Read persistent 1-minute OHLC candles rather than reconstructing history
+        # from the small rolling list of raw ticks.
+        raw_history = r.lrange(f"candles:1m:{symbol}", 0, -1)
+        raw_current = r.get(f"candles:current:{symbol}")
+        candle_records = []
+        for item in raw_history:
             try:
-                tick = json.loads(item)
-                price = float(tick["price"])
-                if math.isfinite(price) and price > 0:
-                    records.append({"timestamp": tick["timestamp"], "price": price})
-            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                candle = json.loads(item)
+                candle_records.append(candle)
+            except (ValueError, TypeError, json.JSONDecodeError):
                 continue
-        frame = pd.DataFrame(records)
-        if frame.empty:
-            st.info(f"No valid market ticks are available for {symbol} yet.")
-            return
+        if raw_current:
+            try:
+                candle_records.append(json.loads(raw_current))
+            except (ValueError, TypeError, json.JSONDecodeError):
+                pass
 
-        frame["timestamp"] = pd.to_datetime(
-            frame["timestamp"], utc=True, errors="coerce"
-        )
-        frame = frame.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
-        if frame.empty:
-            st.info("No valid timestamps are available to chart yet.")
-            return
+        if not candle_records:
+            # Compatibility fallback for data collected before persistent candles were added.
+            raw_ticks = r.lrange(f"ticks:{symbol}", 0, -1)
+            records = []
+            for item in raw_ticks:
+                try:
+                    tick = json.loads(item)
+                    price = float(tick["price"])
+                    if math.isfinite(price) and price > 0:
+                        records.append({"timestamp": tick["timestamp"], "price": price})
+                except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+                    continue
+            frame = pd.DataFrame(records)
+            if frame.empty:
+                st.info(f"No saved price history is available for {symbol} yet. History will build as the collector records candles.")
+                return
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+            frame = frame.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
+            if frame.empty:
+                st.info("No valid timestamps are available to chart yet.")
+                return
+            minute = frame.set_index("timestamp")["price"].resample("1min").ohlc().dropna()
+            ohlc = minute.resample(candle_interval).agg({
+                "open": "first", "high": "max", "low": "min", "close": "last"
+            }).dropna()
+            history_note = "Using recent tick data; persistent candle history will accumulate from the collector."
+        else:
+            frame = pd.DataFrame(candle_records)
+            required = {"timestamp", "open", "high", "low", "close"}
+            if not required.issubset(frame.columns):
+                st.warning("Saved candle history has an unexpected format.")
+                return
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+            for column in ("open", "high", "low", "close"):
+                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            frame = frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
+            frame = frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+            if frame.empty:
+                st.info("No valid saved candles are available yet.")
+                return
+            ohlc = frame.set_index("timestamp")[["open", "high", "low", "close"]].resample(
+                candle_interval
+            ).agg({
+                "open": "first", "high": "max", "low": "min", "close": "last"
+            }).dropna()
+            history_note = "Candles are retained in Redis across collector restarts; older history starts accumulating after this update."
 
-        ohlc = frame.set_index("timestamp")["price"].resample(candle_interval).ohlc().dropna()
         if ohlc.empty:
-            st.info("Waiting for enough ticks to build candles.")
+            st.info("Waiting for enough price data to build candles.")
             return
 
         fig = go.Figure(data=[go.Candlestick(
@@ -358,19 +432,30 @@ def live_chart(symbol, candle_interval):
             low=ohlc["low"],
             close=ohlc["close"],
             name=symbol,
+            increasing=dict(line=dict(color="#20D6C7"), fillcolor="#20D6C7"),
+            decreasing=dict(line=dict(color="#F04452"), fillcolor="#F04452"),
         )])
         fig.update_layout(
             title=f"{symbol} · {candle_interval} candles",
             margin=dict(l=8, r=8, t=42, b=8),
             height=500,
             template="plotly_dark",
+            paper_bgcolor="#0B0F14",
+            plot_bgcolor="#0B0F14",
             dragmode="pan",
             uirevision=f"{symbol}-{candle_interval}",
-            xaxis=dict(fixedrange=False, showgrid=True, rangeslider=dict(visible=False)),
-            yaxis=dict(side="right", fixedrange=False),
+            xaxis=dict(
+                fixedrange=False, showgrid=True, gridcolor="rgba(150,160,175,0.14)",
+                rangeslider=dict(visible=False), type="date"
+            ),
+            yaxis=dict(
+                side="right", fixedrange=False, showgrid=True,
+                gridcolor="rgba(150,160,175,0.14)"
+            ),
             hovermode="x unified",
         )
-        st.caption("On touchscreens, pinch with two fingers to zoom; spread fingers to zoom out. Drag to pan. Use the chart toolbar to reset the view.")
+        st.caption(history_note)
+        st.caption("On touchscreens, pinch with two fingers to zoom; drag to pan. Use the chart toolbar to reset the view.")
         st.plotly_chart(
             fig,
             use_container_width=True,
@@ -383,8 +468,8 @@ def live_chart(symbol, candle_interval):
                 "modeBarButtonsToRemove": ["lasso2d", "select2d"],
             },
         )
-    except Exception as exc:
-        st.error(f"Could not render the chart: {exc}")
+    except Exception:
+        st.error("Could not render the chart. Check the saved candle data and Redis connection.")
 
 
 tab1, tab2, tab3 = st.tabs(["Live charts & portfolio", "Audit trail & analytics", "PDF learning library"])
