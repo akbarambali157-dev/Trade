@@ -386,6 +386,9 @@ def run_collector():
                 client.set(f"health:last_tick:{symbol}", str(received_at), ex=3600)
                 client.rpush(f"ticks:{symbol}", json.dumps(tick))
                 client.ltrim(f"ticks:{symbol}", -MAX_TICKS_PER_SYMBOL, -1)
+                # Gold is chart-only until a dedicated paper-market model is configured.
+                if symbol == "OANDA:XAU_USD":
+                    continue
                 owned = symbol in portfolio.positions
                 decision, reason, atr = engine.process_incoming_tick(symbol, float(price), timestamp, owned)
                 # Check protective stops on every valid tick, including during indicator warm-up.
