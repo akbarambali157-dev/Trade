@@ -6,6 +6,8 @@ A **simulation-only** market-data and paper-trading prototype. It does not conne
 
 - `app.py` — read-only Streamlit dashboard for charts, simulated portfolio state, local audit records, and a searchable PDF learning library.
 - `collector.py` — separate Finnhub WebSocket collector and simulated portfolio engine.
+- `candle_storage.py` — persistent SQLite candle history and strict 5-minute/30-minute aggregation from completed one-minute candles.
+- `test_candle_storage.py` — tests for timeframe aggregation and missing-minute handling.
 - `test_trading_bot.py` — unit tests for the trading logic.
 - `requirements.txt` — Python dependencies, including PyMuPDF for PDF text extraction and page previews.
 
@@ -62,6 +64,14 @@ If the collector runs separately, both processes must use the same Redis instanc
 - **SQLite is local to each service.** The collector's `trading_bot.db` will not automatically appear inside Streamlit Community Cloud when they run as separate services. In that setup, the dashboard can show live ticks and portfolio state through Redis, but audit history requires a shared persistent database. The current collector uses SQLite; shared PostgreSQL support has not yet been implemented.
 - **Redis persistence depends on your provider's configuration.** The collector stores current portfolio state in Redis, so use a trusted instance with appropriate access controls and persistence settings.
 - This is a development prototype. Its strategy and simulated performance have not been validated for real-money use.
+
+## Candle history and timeframes
+
+The collector keeps a rolling Redis list for recent one-minute chart data and also writes each completed one-minute candle to the local SQLite database configured by `TRADING_DB_PATH` (default: `trading_bot.db`). Complete 5-minute and 30-minute candles are derived from the stored one-minute records and published to Redis under `candles:5m:<symbol>` and `candles:30m:<symbol>`.
+
+Aggregation requires every expected minute timestamp in a bucket; missing minute records are not filled with invented prices. This is a conservative completeness check, but it cannot detect every period of sparse tick updates inside a minute. The current candle remains provisional until a later tick rolls it over. Keep the collector running and preserve its SQLite database to build a longer local history.
+
+SQLite is local to the collector machine/container. If the collector runs on an ephemeral worker, configure a persistent volume or the local history may be lost on restart/redeploy. Redis retention remains capped for recent chart data; the SQLite table is the long-term local record. This feature does not create historical data from before collection started and does not guarantee uninterrupted provider ticks.
 
 ## Tests
 
