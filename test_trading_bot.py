@@ -146,3 +146,41 @@ def test_historical_permission_cache_skips_network_request(monkeypatch):
 
     assert fetch_historical_candles(client, symbol) == 0
     assert client.get(f"history:status:{symbol}") == "permission_denied_cached"
+
+
+
+def test_meridian_brain_explains_aligned_bullish_conditions():
+    from brain import MeridianBrain
+
+    result = MeridianBrain().decide(
+        close=105.0, sma=100.0, rsi=60.0, atr=2.0,
+        previous_close=104.0, is_owned=False,
+    )
+    assert result["action"] == "BUY"
+    assert result["score"] == 3
+    assert result["trend"] == "up"
+    assert result["momentum"] == "rising"
+    assert result["rsi_state"] == "strong"
+    assert "Entry condition" in result["reason"]
+
+
+def test_meridian_brain_holds_when_signals_conflict():
+    from brain import MeridianBrain
+
+    result = MeridianBrain().decide(
+        close=101.0, sma=100.0, rsi=45.0, atr=2.0,
+        previous_close=102.0, is_owned=False,
+    )
+    assert result["action"] == "HOLD"
+    assert "No sufficiently aligned" in result["reason"]
+
+
+def test_meridian_brain_sells_owned_position_on_bearish_conditions():
+    from brain import MeridianBrain
+
+    result = MeridianBrain().decide(
+        close=98.0, sma=100.0, rsi=40.0, atr=2.0,
+        previous_close=99.0, is_owned=True,
+    )
+    assert result["action"] == "SELL"
+    assert result["score"] == -3
