@@ -17,7 +17,7 @@ import websocket
 from dotenv import load_dotenv
 
 load_dotenv()
-WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA"]
+WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA", "BINANCE:BTCUSDT"]
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 DB_NAME = os.getenv("TRADING_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "trading_bot.db"))
@@ -335,10 +335,36 @@ def run_collector():
     latest_prices = {}
     last_timestamps = {sym: 0 for sym in WATCHLIST}
     state_lock = threading.RLock()
+    connection_state = {"finnhub": "connecting"}
+
+    def publish_health_heartbeat():
+        """Publish short-lived health keys so the dashboard can detect a stale worker."""
+        while True:
+            try:
+                with state_lock:
+                    finnhub_state = connection_state["finnhub"]
+                client.set("health:collector:status", "running", ex=45)
+                client.set("health:collector:heartbeat", str(time.time()), ex=45)
+                client.set("health:finnhub:status", finnhub_state, ex=45)
+                client.set("health:collector:watchlist", json.dumps(WATCHLIST), ex=45)
+            except Exception as exc:
+                log.warning("Could not publish health heartbeat: %s", exc)
+            time.sleep(10)
+
+    def set_finnhub_status(status):
+        with state_lock:
+            connection_state["finnhub"] = status
+        try:
+            client.set("health:finnhub:status", status, ex=45)
+        except Exception as exc:
+            log.warning("Could not publish Finnhub connection status: %s", exc)
+
+    threading.Thread(target=publish_health_heartbeat, daemon=True).start()
 
     def on_message(ws, message):
         try:
             data = json.loads(message)
+            client.set("health:finnhub:last_message", str(time.time()), ex=3600)
             if data.get("type") != "trade" or not isinstance(data.get("data"), list):
                 return
             for trade in data["data"]:
@@ -368,21 +394,27 @@ def run_collector():
             log.exception("Message processing failed")
 
     def on_open(ws):
+        set_finnhub_status("connected")
+        client.set("health:finnhub:last_connected", str(time.time()), ex=3600)
         log.info("Connected to Finnhub; subscribing to %s", WATCHLIST)
         for sym in WATCHLIST:
             ws.send(json.dumps({"type": "subscribe", "symbol": sym}))
+            log.info("Subscribed to %s", sym)
             time.sleep(0.05)
 
     def on_error(ws, error):
+        set_finnhub_status("error")
         log.error("WebSocket error: %s", error)
 
     def on_close(ws, status_code, message):
+        set_finnhub_status("disconnected")
         log.warning("WebSocket closed (%s): %s", status_code, message)
 
     socket_url = f"wss://ws.finnhub.io?token={FINNHUB_KEY}"
     retry_delay = 1
     while True:
         try:
+            set_finnhub_status("connecting")
             log.info("Connecting to Finnhub")
             ws = websocket.WebSocketApp(socket_url, on_open=on_open, on_message=on_message,
                                         on_error=on_error, on_close=on_close)
