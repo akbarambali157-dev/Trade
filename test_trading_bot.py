@@ -3,7 +3,7 @@ import sqlite3
 
 import pytest
 
-from collector import CandleBasedEngine, RealisticPortfolio
+from collector import CandleBasedEngine, RealisticPortfolio, fetch_historical_candles
 
 
 class FakeRedis:
@@ -127,3 +127,22 @@ def test_cash_sizing_includes_commission(portfolio):
     if "AAPL" in bot.positions:
         position = bot.positions["AAPL"]
         assert position["shares"] * position["entry_price"] * (1 + bot.commission_pct) <= 1000.0 + 1e-6
+
+
+
+def test_historical_permission_cache_skips_network_request(monkeypatch):
+    import time
+    import collector
+
+    client = FakeRedis()
+    symbol = "AAPL"
+    client.set(f"history:blocked_until:{symbol}", str(time.time() + 3600))
+
+    def unexpected_request(*args, **kwargs):
+        raise AssertionError("A cached permission denial should skip the HTTP request")
+
+    monkeypatch.setattr(collector, "FINNHUB_KEY", "test-key")
+    monkeypatch.setattr(collector.urllib.request, "urlopen", unexpected_request)
+
+    assert fetch_historical_candles(client, symbol) == 0
+    assert client.get(f"history:status:{symbol}") == "permission_denied_cached"
