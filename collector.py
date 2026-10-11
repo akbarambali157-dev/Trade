@@ -17,7 +17,6 @@ from datetime import datetime, timezone
 
 import redis
 import websocket
-from brain import MeridianBrain
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -429,8 +428,6 @@ class CandleBasedEngine:
             raise ValueError("Indicator periods must be positive.")
         self.candle_history = {sym: [] for sym in WATCHLIST}
         self.current_candles = {}
-        self.brain = MeridianBrain()
-        self.last_analysis = {}
 
     def compute_robust_rsi(self, closes):
         if len(closes) < self.rsi_period + 1:
@@ -491,17 +488,15 @@ class CandleBasedEngine:
             return "HOLD", "Waiting for valid ATR", None
         close = closes[-1]
         previous_close = closes[-2]
-        self.last_analysis[symbol] = self.brain.decide(
-            close=close, sma=sma, rsi=rsi, atr=atr,
-            previous_close=previous_close, is_owned=is_owned,
-        )
-        analysis = self.last_analysis[symbol]
+        # MeridianBrain is temporarily disconnected. Keep collecting data and
+        # calculating indicators, but do not generate new strategy entries/exits.
+        # Realized/protective ATR stops are still checked by RealisticPortfolio
+        # on each incoming tick.
         reason = (
-            f"{analysis['reason']} | score {analysis['score']:+d} | "
-            f"trend {analysis['trend']} | momentum {analysis['momentum']} | "
-            f"RSI {rsi:.1f} | ATR {atr:.4f}"
+            f"Brain module disabled; signal generation paused | "
+            f"SMA {sma:.4f} | RSI {rsi:.1f} | ATR {atr:.4f}"
         )
-        return analysis["action"], reason, atr
+        return "HOLD", reason, atr
 
 
 def run_collector():
@@ -591,10 +586,7 @@ def run_collector():
                         f"{symbol}: {decision} · {reason[:110]}",
                         ex=3600,
                     )
-                    analysis = engine.last_analysis.get(symbol)
-                    if analysis:
-                        client.set(f"bot:last_analysis:{symbol}", json.dumps(analysis), ex=3600)
-                        client.set("bot:last_analysis_symbol", symbol, ex=3600)
+                    # No brain analysis is published while the brain module is disabled.
                 except Exception:
                     log.debug("Could not publish latest strategy decision", exc_info=True)
                 # Check protective stops on every valid tick, including during indicator warm-up.
