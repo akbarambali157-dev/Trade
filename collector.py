@@ -140,7 +140,10 @@ def fetch_historical_candles(client, symbol, lookback_days=7):
                     "open": float(payload["o"][i]), "high": float(payload["h"][i]),
                     "low": float(payload["l"][i]), "close": float(payload["c"][i]),
                 }
-                if all(math.isfinite(row[k]) and row[k] > 0 for k in ("open", "high", "low", "close")):
+                prices = (row["open"], row["high"], row["low"], row["close"])
+                if (all(math.isfinite(value) and value > 0 for value in prices)
+                        and row["high"] >= max(row["open"], row["close"], row["low"])
+                        and row["low"] <= min(row["open"], row["close"], row["high"])):
                     rows.append(row)
             except (IndexError, TypeError, ValueError):
                 continue
