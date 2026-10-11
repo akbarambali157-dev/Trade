@@ -186,7 +186,7 @@ class RealisticPortfolio:
                 del self.positions[symbol]
                 self.save_state()
                 return True
-            if math.isfinite(current_atr) and current_atr > 0:
+            if isinstance(current_atr, (int, float)) and math.isfinite(current_atr) and current_atr > 0:
                 proposed = current_price - current_atr * self.atr_multiplier
                 if proposed > stop:
                     pos["atr_stop"] = proposed
@@ -359,10 +359,8 @@ def run_collector():
                 client.ltrim(f"ticks:{symbol}", -MAX_TICKS_PER_SYMBOL, -1)
                 owned = symbol in portfolio.positions
                 decision, reason, atr = engine.process_incoming_tick(symbol, float(price), timestamp, owned)
-                # Evaluate stop-losses and trail stops on every valid tick, even when
-                # the strategy's entry/exit signal is HOLD.
-                if atr is not None:
-                    portfolio.process_signal(symbol, float(price), timestamp, decision, reason, atr, latest_prices)
+                # Check protective stops on every valid tick, including during indicator warm-up.
+                portfolio.process_signal(symbol, float(price), timestamp, decision, reason, atr, latest_prices)
         except Exception:
             log.exception("Message processing failed")
 
