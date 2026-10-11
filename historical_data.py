@@ -19,6 +19,7 @@ from pathlib import Path
 
 ARCHIVE_DIR = Path(__file__).resolve().parent / "data" / "historical"
 ARCHIVE_FILE = ARCHIVE_DIR / "xauusd_m1.csv"
+SUPPORTED_TIMEFRAMES = {"m1", "m5", "m15", "m30", "h1", "h4", "d1"}
 
 
 def default_archive_file(timeframe):
@@ -26,7 +27,6 @@ def default_archive_file(timeframe):
     if timeframe not in SUPPORTED_TIMEFRAMES:
         raise ValueError(f"Unsupported timeframe {timeframe!r}; choose from {sorted(SUPPORTED_TIMEFRAMES)}")
     return ARCHIVE_DIR / f"xauusd_{timeframe}.csv"
-SUPPORTED_TIMEFRAMES = {"m1", "m5", "m15", "m30", "h1", "h4", "d1"}
 FIELDS = ("timestamp", "open", "high", "low", "close", "volume")
 
 
