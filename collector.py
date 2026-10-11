@@ -22,6 +22,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 DB_NAME = os.getenv("TRADING_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "trading_bot.db"))
 MAX_TICKS_PER_SYMBOL = 500
+MAX_CANDLES_PER_SYMBOL = 5000
 TICK_FRESH_SECONDS = 120
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -32,6 +33,38 @@ def utc_timestamp(timestamp_ms=None):
     if timestamp_ms is None:
         return datetime.now(timezone.utc).isoformat(timespec="seconds")
     return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def store_minute_candle(client, symbol, timestamp_ms, price):
+    """Persist a rolling 1-minute OHLC history in Redis, independent of raw tick retention."""
+    minute_start_ms = int(timestamp_ms // 60000) * 60000
+    candle_key = f"candles:current:{symbol}"
+    history_key = f"candles:1m:{symbol}"
+    raw = client.get(candle_key)
+    current = None
+    if raw:
+        try:
+            current = json.loads(raw)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            current = None
+
+    minute_stamp = utc_timestamp(minute_start_ms)
+    if current and current.get("timestamp") == minute_stamp:
+        current["high"] = max(float(current["high"]), float(price))
+        current["low"] = min(float(current["low"]), float(price))
+        current["close"] = float(price)
+    else:
+        if current and current.get("timestamp"):
+            client.rpush(history_key, json.dumps(current))
+            client.ltrim(history_key, -MAX_CANDLES_PER_SYMBOL, -1)
+        current = {
+            "timestamp": minute_stamp,
+            "open": float(price),
+            "high": float(price),
+            "low": float(price),
+            "close": float(price),
+        }
+    client.set(candle_key, json.dumps(current))
 
 
 def init_db(db_path=DB_NAME):
@@ -386,6 +419,7 @@ def run_collector():
                 client.set(f"health:last_tick:{symbol}", str(received_at), ex=3600)
                 client.rpush(f"ticks:{symbol}", json.dumps(tick))
                 client.ltrim(f"ticks:{symbol}", -MAX_TICKS_PER_SYMBOL, -1)
+                store_minute_candle(client, symbol, timestamp, float(price))
                 # Gold is chart-only until a dedicated paper-market model is configured.
                 if symbol == "OANDA:XAU_USD":
                     continue
