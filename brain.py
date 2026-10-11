@@ -33,6 +33,9 @@ class MeridianBrain:
         if close <= 0 or sma <= 0 or atr <= 0 or previous_close <= 0:
             return BrainDecision("HOLD", 0, "unknown", "unknown", "unknown", 0.0,
                                  "Waiting for positive price and volatility data").to_dict()
+        if not 0.0 <= rsi <= 100.0:
+            return BrainDecision("HOLD", 0, "unknown", "unknown", "unknown", 0.0,
+                                 "Waiting for RSI within its valid 0–100 range").to_dict()
 
         trend = "up" if close > sma else "down" if close < sma else "flat"
         momentum = "rising" if close > previous_close else "falling" if close < previous_close else "flat"
