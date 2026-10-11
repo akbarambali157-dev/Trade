@@ -223,6 +223,15 @@ def init_db(db_path=DB_NAME):
         if "event_id" not in columns:
             conn.execute("ALTER TABLE trades ADD COLUMN event_id TEXT")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_event_id ON trades(event_id)")
+        # SQLite is the durable source of truth; Redis is a fast shared cache.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                cash REAL NOT NULL,
+                positions_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
 
 
@@ -245,43 +254,108 @@ class RealisticPortfolio:
         init_db(self.db_path)
         self.load_state()
 
-    def load_state(self):
-        if self.redis is None:
-            return
-        saved_cash = self.redis.get("portfolio:cash")
-        saved_positions = self.redis.get("portfolio:positions")
-        if saved_cash is None and saved_positions is None:
-            self.total_cash, self.positions = self.default_cash, {}
-            self.save_state()
-            return
-        if saved_cash is None or saved_positions is None:
-            raise RuntimeError("Incomplete saved portfolio state; refusing to reset it.")
-        try:
-            cash = float(saved_cash)
-            positions = json.loads(saved_positions)
-            if not math.isfinite(cash) or cash < 0 or not isinstance(positions, dict):
-                raise ValueError("Invalid portfolio cash or positions.")
-            for symbol, pos in positions.items():
-                required = ("shares", "entry_price", "atr_stop", "entry_commission")
-                if not isinstance(pos, dict) or any(k not in pos for k in required):
-                    raise ValueError(f"Invalid saved position for {symbol}.")
-                if any(not math.isfinite(float(pos[k])) for k in required):
-                    raise ValueError(f"Non-finite saved position value for {symbol}.")
-                if float(pos["shares"]) <= 0 or float(pos["entry_price"]) <= 0:
-                    raise ValueError(f"Invalid shares or entry price for {symbol}.")
-            self.total_cash, self.positions = cash, positions
-            log.info("Portfolio restored: cash=$%.2f positions=%s", cash, list(positions))
-        except Exception as exc:
-            raise RuntimeError("Saved portfolio is invalid; refusing to trade until it is repaired.") from exc
+    def _validate_state(self, cash_value, positions_value):
+        cash = float(cash_value)
+        positions = json.loads(positions_value) if isinstance(positions_value, str) else positions_value
+        if not math.isfinite(cash) or cash < 0 or not isinstance(positions, dict):
+            raise ValueError("Invalid portfolio cash or positions.")
+        for symbol, pos in positions.items():
+            required = ("shares", "entry_price", "atr_stop", "entry_commission")
+            if not isinstance(pos, dict) or any(k not in pos for k in required):
+                raise ValueError(f"Invalid saved position for {symbol}.")
+            if any(not math.isfinite(float(pos[k])) for k in required):
+                raise ValueError(f"Non-finite saved position value for {symbol}.")
+            if float(pos["shares"]) <= 0 or float(pos["entry_price"]) <= 0:
+                raise ValueError(f"Invalid shares or entry price for {symbol}.")
+            if float(pos["atr_stop"]) <= 0 or float(pos["entry_commission"]) < 0:
+                raise ValueError(f"Invalid stop or commission for {symbol}.")
+        return cash, positions
 
-    def save_state(self):
+    def _write_state_snapshot(self, conn, cash, positions):
+        conn.execute(
+            """INSERT INTO portfolio_state (id, cash, positions_json, updated_at)
+               VALUES (1, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                   cash=excluded.cash,
+                   positions_json=excluded.positions_json,
+                   updated_at=excluded.updated_at""",
+            (float(cash), json.dumps(positions, sort_keys=True), utc_timestamp(time.time() * 1000)),
+        )
+
+    def _sync_redis_state(self):
         if self.redis is None:
             return
-        # Use a Redis transaction so cash and positions are written together.
         with self.redis.pipeline(transaction=True) as pipe:
             pipe.set("portfolio:cash", repr(self.total_cash))
             pipe.set("portfolio:positions", json.dumps(self.positions))
             pipe.execute()
+
+    def load_state(self):
+        try:
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                row = conn.execute(
+                    "SELECT cash, positions_json FROM portfolio_state WHERE id=1"
+                ).fetchone()
+            if row is not None:
+                cash, positions = self._validate_state(row[0], row[1])
+                self.total_cash, self.positions = cash, positions
+                # Repair a stale Redis cache from the durable SQLite snapshot.
+                self._sync_redis_state()
+                log.info("Portfolio restored from SQLite: cash=$%.2f positions=%s",
+                         cash, list(positions))
+                return
+
+            # One-time migration path for existing installations without a snapshot.
+            saved_cash = self.redis.get("portfolio:cash") if self.redis is not None else None
+            saved_positions = self.redis.get("portfolio:positions") if self.redis is not None else None
+            if saved_cash is None and saved_positions is None:
+                cash, positions = self.default_cash, {}
+            elif saved_cash is None or saved_positions is None:
+                raise RuntimeError("Incomplete saved portfolio state; refusing to reset it.")
+            else:
+                cash, positions = self._validate_state(saved_cash, saved_positions)
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                self._write_state_snapshot(conn, cash, positions)
+            self.total_cash, self.positions = cash, positions
+            self._sync_redis_state()
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and "Saved portfolio" in str(exc):
+                raise
+            raise RuntimeError(
+                "Saved portfolio is invalid or could not be restored; refusing to trade."
+            ) from exc
+
+    def save_state(self):
+        # Commit durable state first. If Redis fails, the next startup repairs its cache.
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            conn.execute("PRAGMA busy_timeout=10000")
+            self._write_state_snapshot(conn, self.total_cash, self.positions)
+            conn.commit()
+        self._sync_redis_state()
+
+    def commit_trade_state(self, timestamp, symbol, action, price, shares,
+                           pnl_usd, pnl_pct, reason, new_cash, new_positions):
+        """Atomically persist an idempotent trade event and its resulting portfolio state."""
+        event_id = f"{timestamp}|{symbol}|{action}|{price:.8f}|{shares:.8f}"
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            conn.execute("PRAGMA busy_timeout=10000")
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO trades
+                (event_id, timestamp, symbol, action, price, shares, pnl_usd, pnl_pct, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (event_id, timestamp, symbol, action, float(price), float(shares),
+                  float(pnl_usd), str(pnl_pct), str(reason)))
+            if cursor.rowcount == 0:
+                conn.rollback()
+                self.load_state()
+                return False
+            self._write_state_snapshot(conn, new_cash, new_positions)
+            conn.commit()
+        # The durable event + snapshot are committed together before mutating memory/cache.
+        self.total_cash = float(new_cash)
+        self.positions = json.loads(json.dumps(new_positions))
+        self._sync_redis_state()
+        return True
 
     def get_current_portfolio_equity(self, latest_prices, now=None):
         with self.lock:
@@ -346,11 +420,15 @@ class RealisticPortfolio:
                 total_entry_cost = shares * float(pos["entry_price"]) + float(pos["entry_commission"])
                 pnl = net_proceeds - total_entry_cost
                 pnl_pct = pnl / total_entry_cost * 100.0 if total_entry_cost else 0.0
-                self.log_trade(utc_timestamp(timestamp), symbol, "SELL", current_price, shares,
-                               round(pnl, 2), f"{pnl_pct:+.2f}%", f"ATR stop triggered at {pnl_pct:+.2f}%")
-                self.total_cash += net_proceeds
-                del self.positions[symbol]
-                self.save_state()
+                dt = utc_timestamp(timestamp)
+                new_positions = dict(self.positions)
+                del new_positions[symbol]
+                if not self.commit_trade_state(
+                    dt, symbol, "SELL", current_price, shares, round(pnl, 2),
+                    f"{pnl_pct:+.2f}%", f"ATR stop triggered at {pnl_pct:+.2f}%",
+                    self.total_cash + net_proceeds, new_positions,
+                ):
+                    return symbol not in self.positions
                 return True
             if isinstance(current_atr, (int, float)) and math.isfinite(current_atr) and current_atr > 0:
                 proposed = current_price - current_atr * self.atr_multiplier
@@ -396,11 +474,12 @@ class RealisticPortfolio:
                 pos = {"shares": shares, "entry_price": price,
                        "atr_stop": price - risk_per_share,
                        "entry_commission": shares * price * self.commission_pct}
-                # Record first; do not mutate portfolio if the audit write fails.
-                self.log_trade(dt, symbol, "BUY", price, shares, 0.0, "0.00%", reason)
-                self.positions[symbol] = pos
-                self.total_cash -= cost
-                self.save_state()
+                new_positions = dict(self.positions)
+                new_positions[symbol] = pos
+                self.commit_trade_state(
+                    dt, symbol, "BUY", price, shares, 0.0, "0.00%", reason,
+                    self.total_cash - cost, new_positions,
+                )
             elif decision == "SELL" and symbol in self.positions:
                 pos = self.positions[symbol]
                 shares = float(pos["shares"])
@@ -408,10 +487,12 @@ class RealisticPortfolio:
                 entry_cost = shares * float(pos["entry_price"]) + float(pos["entry_commission"])
                 pnl = proceeds - entry_cost
                 pnl_pct = pnl / entry_cost * 100.0 if entry_cost else 0.0
-                self.log_trade(dt, symbol, "SELL", price, shares, round(pnl, 2), f"{pnl_pct:+.2f}%", reason)
-                self.total_cash += proceeds
-                del self.positions[symbol]
-                self.save_state()
+                new_positions = dict(self.positions)
+                del new_positions[symbol]
+                self.commit_trade_state(
+                    dt, symbol, "SELL", price, shares, round(pnl, 2),
+                    f"{pnl_pct:+.2f}%", reason, self.total_cash + proceeds, new_positions,
+                )
 
 
 class CandleBasedEngine:
