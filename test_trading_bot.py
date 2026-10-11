@@ -184,3 +184,16 @@ def test_meridian_brain_sells_owned_position_on_bearish_conditions():
     )
     assert result["action"] == "SELL"
     assert result["score"] == -3
+
+
+
+@pytest.mark.parametrize("invalid_rsi", [-0.1, 100.1, float("inf"), float("nan")])
+def test_meridian_brain_holds_for_invalid_rsi(invalid_rsi):
+    from brain import MeridianBrain
+
+    result = MeridianBrain().decide(
+        close=105.0, sma=100.0, rsi=invalid_rsi, atr=2.0,
+        previous_close=104.0, is_owned=False,
+    )
+    assert result["action"] == "HOLD"
+    assert "valid 0–100 range" in result["reason"]
