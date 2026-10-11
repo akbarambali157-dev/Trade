@@ -10,6 +10,8 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 import redis
@@ -65,6 +67,74 @@ def store_minute_candle(client, symbol, timestamp_ms, price):
             "close": float(price),
         }
     client.set(candle_key, json.dumps(current))
+
+
+def fetch_historical_candles(client, symbol, lookback_days=7):
+    """Best-effort historical candles via Finnhub REST; live collection continues if unavailable."""
+    if not FINNHUB_KEY:
+        log.warning("Historical candles skipped for %s: FINNHUB_KEY is not configured", symbol)
+        return 0
+    endpoint = {
+        "BINANCE:BTCUSDT": "crypto/candle",
+        "OANDA:XAU_USD": "forex/candle",
+        "AAPL": "stock/candle",
+        "MSFT": "stock/candle",
+        "TSLA": "stock/candle",
+        "NVDA": "stock/candle",
+    }.get(symbol)
+    if not endpoint:
+        return 0
+    now = int(time.time())
+    params = urllib.parse.urlencode({
+        "symbol": symbol, "resolution": "1",
+        "from": now - int(lookback_days * 86400), "to": now,
+        "token": FINNHUB_KEY,
+    })
+    url = f"https://finnhub.io/api/v1/{endpoint}?{params}"
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "MeridianPaperDashboard/1.0"})
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if payload.get("s") != "ok":
+            log.warning("Finnhub historical candles unavailable for %s (status=%s)", symbol, payload.get("s"))
+            return 0
+        rows = []
+        for i, epoch in enumerate(payload.get("t", [])):
+            try:
+                row = {
+                    "timestamp": utc_timestamp(float(epoch) * 1000),
+                    "open": float(payload["o"][i]), "high": float(payload["h"][i]),
+                    "low": float(payload["l"][i]), "close": float(payload["c"][i]),
+                }
+                if all(math.isfinite(row[k]) and row[k] > 0 for k in ("open", "high", "low", "close")):
+                    rows.append(row)
+            except (IndexError, TypeError, ValueError):
+                continue
+        if not rows:
+            return 0
+        # Merge with any already saved candles, preferring existing/live data for duplicate minutes.
+        key = f"candles:1m:{symbol}"
+        existing = {}
+        for raw in client.lrange(key, 0, -1):
+            try:
+                item = json.loads(raw)
+                existing[item["timestamp"]] = item
+            except (ValueError, TypeError, KeyError):
+                continue
+        for row in rows:
+            existing.setdefault(row["timestamp"], row)
+        merged = [existing[k] for k in sorted(existing)][-MAX_CANDLES_PER_SYMBOL:]
+        with client.pipeline(transaction=True) as pipe:
+            pipe.delete(key)
+            if merged:
+                pipe.rpush(key, *[json.dumps(row) for row in merged])
+            pipe.execute()
+        log.info("Loaded %s historical 1-minute candles for %s", len(rows), symbol)
+        return len(rows)
+    except Exception as exc:
+        # Do not log request URLs, which contain the API token.
+        log.warning("Could not load historical candles for %s: %s", symbol, type(exc).__name__)
+        return 0
 
 
 def init_db(db_path=DB_NAME):
@@ -363,6 +433,10 @@ def run_collector():
     client = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=3.0)
     client.ping()
     log.info("Connected to Redis")
+    # Load a recent historical window once at startup; API access varies by symbol and plan.
+    for history_symbol in WATCHLIST:
+        fetch_historical_candles(client, history_symbol, lookback_days=7)
+        time.sleep(0.25)
     portfolio = RealisticPortfolio(redis_client=client)
     engine = CandleBasedEngine()
     latest_prices = {}
