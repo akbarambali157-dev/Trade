@@ -10,6 +10,7 @@ import os
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -96,7 +97,10 @@ def fetch_historical_candles(client, symbol, lookback_days=7):
         with urllib.request.urlopen(request, timeout=12) as response:
             payload = json.loads(response.read().decode("utf-8"))
         if payload.get("s") != "ok":
-            log.warning("Finnhub historical candles unavailable for %s (status=%s)", symbol, payload.get("s"))
+            # Finnhub often returns an explanatory error field when a symbol or
+            # endpoint is not available on the current account plan.
+            detail = payload.get("error") or payload.get("s") or "unknown response"
+            log.warning("Finnhub history rejected for %s: %s", symbol, str(detail)[:220])
             return 0
         rows = []
         for i, epoch in enumerate(payload.get("t", [])):
@@ -131,9 +135,24 @@ def fetch_historical_candles(client, symbol, lookback_days=7):
             pipe.execute()
         log.info("Loaded %s historical 1-minute candles for %s", len(rows), symbol)
         return len(rows)
+    except urllib.error.HTTPError as exc:
+        # Log the HTTP status and a short response explanation, never the request URL
+        # because it contains the Finnhub token.
+        try:
+            detail = exc.read(300).decode("utf-8", errors="replace").replace("\\n", " ")
+        except Exception:
+            detail = ""
+        log.warning("Historical request for %s failed with HTTP %s: %s",
+                    symbol, exc.code, detail[:220] or "no response detail")
+        return 0
+    except urllib.error.URLError as exc:
+        log.warning("Historical request for %s could not reach Finnhub: %s",
+                    symbol, str(getattr(exc, "reason", "network error"))[:180])
+        return 0
     except Exception as exc:
         # Do not log request URLs, which contain the API token.
         log.warning("Could not load historical candles for %s: %s", symbol, type(exc).__name__)
+        log.debug("Historical candle failure details", exc_info=True)
         return 0
 
 
@@ -433,14 +452,6 @@ def run_collector():
     client = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=3.0)
     client.ping()
     log.info("Connected to Redis")
-    # Load a recent historical window once at startup; API access varies by symbol and plan.
-    for history_symbol in WATCHLIST:
-        fetch_historical_candles(client, history_symbol, lookback_days=7)
-        time.sleep(0.25)
-    portfolio = RealisticPortfolio(redis_client=client)
-    engine = CandleBasedEngine()
-    latest_prices = {}
-    last_timestamps = {sym: 0 for sym in WATCHLIST}
     state_lock = threading.RLock()
     connection_state = {"finnhub": "connecting"}
 
@@ -466,7 +477,19 @@ def run_collector():
         except Exception as exc:
             log.warning("Could not publish Finnhub connection status: %s", exc)
 
+    # Start health reporting immediately. Historical REST calls can each take up to
+    # 12 seconds, so starting this thread afterwards made a healthy process look stale.
     threading.Thread(target=publish_health_heartbeat, daemon=True).start()
+
+    # Load a recent historical window once at startup; API access varies by symbol and plan.
+    log.info("Loading recent historical candles (this may take up to about 75 seconds)")
+    for history_symbol in WATCHLIST:
+        fetch_historical_candles(client, history_symbol, lookback_days=7)
+        time.sleep(0.25)
+    portfolio = RealisticPortfolio(redis_client=client)
+    engine = CandleBasedEngine()
+    latest_prices = {}
+    last_timestamps = {sym: 0 for sym in WATCHLIST}
 
     def on_message(ws, message):
         try:
