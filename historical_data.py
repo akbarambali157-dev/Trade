@@ -19,6 +19,13 @@ from pathlib import Path
 
 ARCHIVE_DIR = Path(__file__).resolve().parent / "data" / "historical"
 ARCHIVE_FILE = ARCHIVE_DIR / "xauusd_m1.csv"
+
+
+def default_archive_file(timeframe):
+    """Return a timeframe-specific archive path to prevent mixing candle intervals."""
+    if timeframe not in SUPPORTED_TIMEFRAMES:
+        raise ValueError(f"Unsupported timeframe {timeframe!r}; choose from {sorted(SUPPORTED_TIMEFRAMES)}")
+    return ARCHIVE_DIR / f"xauusd_{timeframe}.csv"
 SUPPORTED_TIMEFRAMES = {"m1", "m5", "m15", "m30", "h1", "h4", "d1"}
 FIELDS = ("timestamp", "open", "high", "low", "close", "volume")
 
@@ -158,10 +165,11 @@ def main(argv=None):
     parser.add_argument("--from", dest="date_from", required=True, help="Start date YYYY-MM-DD (inclusive)")
     parser.add_argument("--to", dest="date_to", required=True, help="End date YYYY-MM-DD (exclusive)")
     parser.add_argument("--timeframe", default="m1", choices=sorted(SUPPORTED_TIMEFRAMES))
-    parser.add_argument("--output", default=str(ARCHIVE_FILE), help="Archive CSV path")
+    parser.add_argument("--output", default=None, help="Archive CSV path (defaults to a separate file for each timeframe)")
     args = parser.parse_args(argv)
+    output_path = args.output if args.output is not None else str(default_archive_file(args.timeframe))
     try:
-        download_history(args.date_from, args.date_to, args.timeframe, args.output)
+        download_history(args.date_from, args.date_to, args.timeframe, output_path)
     except (ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
