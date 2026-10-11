@@ -53,6 +53,10 @@ def store_minute_candle(client, symbol, timestamp_ms, price):
             current = None
 
     minute_stamp = utc_timestamp(minute_start_ms)
+    # A delayed/out-of-order tick must not roll the current candle backwards.
+    # Timestamps written by this function use the same normalized UTC format.
+    if current and current.get("timestamp") and current["timestamp"] > minute_stamp:
+        return False
     if current and current.get("timestamp") == minute_stamp:
         current["high"] = max(float(current["high"]), float(price))
         current["low"] = min(float(current["low"]), float(price))
@@ -69,6 +73,7 @@ def store_minute_candle(client, symbol, timestamp_ms, price):
             "close": float(price),
         }
     client.set(candle_key, json.dumps(current))
+    return True
 
 
 def fetch_historical_candles(client, symbol, lookback_days=7):

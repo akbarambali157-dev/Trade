@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from historical_data import merge_archive, normalize_row, parse_timestamp, read_cli_csv
+from historical_data import default_archive_file, merge_archive, normalize_row, parse_timestamp, read_cli_csv
 
 
 def test_parse_unix_milliseconds_to_utc():
@@ -61,3 +61,15 @@ def test_header_only_csv_returns_no_rows(tmp_path):
     path = tmp_path / "empty.csv"
     path.write_text("timestamp,open,high,low,close,volume\n", encoding="utf-8")
     assert read_cli_csv(path) == []
+
+
+
+def test_default_archive_is_separate_for_each_timeframe():
+    assert default_archive_file("m1").name == "xauusd_m1.csv"
+    assert default_archive_file("h1").name == "xauusd_h1.csv"
+    assert default_archive_file("m1") != default_archive_file("h1")
+
+
+def test_default_archive_rejects_unsupported_timeframe():
+    with pytest.raises(ValueError, match="Unsupported timeframe"):
+        default_archive_file("w1")
