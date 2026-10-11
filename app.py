@@ -356,120 +356,106 @@ def portfolio_panel():
 
 @st.fragment(run_every=3)
 def live_chart(symbol, candle_interval):
+    """Terminal-style candlesticks using historical OHLC persisted by collector.py."""
     try:
-        # Read persistent 1-minute OHLC candles rather than reconstructing history
-        # from the small rolling list of raw ticks.
-        raw_history = r.lrange(f"candles:1m:{symbol}", 0, -1)
-        raw_current = r.get(f"candles:current:{symbol}")
-        candle_records = []
-        for item in raw_history:
+        raw = r.lrange(f"candles:1m:{symbol}", 0, -1)
+        current = r.get(f"candles:current:{symbol}")
+        records = []
+        for item in raw:
             try:
-                candle = json.loads(item)
-                candle_records.append(candle)
+                records.append(json.loads(item))
             except (ValueError, TypeError, json.JSONDecodeError):
                 continue
-        if raw_current:
+        if current:
             try:
-                candle_records.append(json.loads(raw_current))
+                records.append(json.loads(current))
             except (ValueError, TypeError, json.JSONDecodeError):
                 pass
-
-        if not candle_records:
-            # Compatibility fallback for data collected before persistent candles were added.
+        if records:
+            frame = pd.DataFrame(records)
+            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
+            for col in ("open", "high", "low", "close"):
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+            frame = frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
+            frame = frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+            history_note = "Historical OHLC candles from Redis, merged with recent live candles."
+        else:
             raw_ticks = r.lrange(f"ticks:{symbol}", 0, -1)
-            records = []
+            ticks = []
             for item in raw_ticks:
                 try:
                     tick = json.loads(item)
                     price = float(tick["price"])
                     if math.isfinite(price) and price > 0:
-                        records.append({"timestamp": tick["timestamp"], "price": price})
+                        ticks.append({"timestamp": tick["timestamp"], "price": price})
                 except (ValueError, TypeError, KeyError, json.JSONDecodeError):
                     continue
-            frame = pd.DataFrame(records)
-            if frame.empty:
-                st.info(f"No saved price history is available for {symbol} yet. History will build as the collector records candles.")
+            tick_frame = pd.DataFrame(ticks)
+            if tick_frame.empty:
+                st.info("Waiting for historical candles or the first live prices from the collector.")
                 return
-            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-            frame = frame.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
-            if frame.empty:
-                st.info("No valid timestamps are available to chart yet.")
-                return
-            minute = frame.set_index("timestamp")["price"].resample("1min").ohlc().dropna()
-            ohlc = minute.resample(candle_interval).agg({
-                "open": "first", "high": "max", "low": "min", "close": "last"
-            }).dropna()
-            history_note = "Using recent tick data; persistent candle history will accumulate from the collector."
-        else:
-            frame = pd.DataFrame(candle_records)
-            required = {"timestamp", "open", "high", "low", "close"}
-            if not required.issubset(frame.columns):
-                st.warning("Saved candle history has an unexpected format.")
-                return
-            frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce")
-            for column in ("open", "high", "low", "close"):
-                frame[column] = pd.to_numeric(frame[column], errors="coerce")
-            frame = frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
-            frame = frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-            if frame.empty:
-                st.info("No valid saved candles are available yet.")
-                return
-            ohlc = frame.set_index("timestamp")[["open", "high", "low", "close"]].resample(
-                candle_interval
-            ).agg({
-                "open": "first", "high": "max", "low": "min", "close": "last"
-            }).dropna()
-            history_note = "Candles are retained in Redis across collector restarts; older history starts accumulating after this update."
-
-        if ohlc.empty:
-            st.info("Waiting for enough price data to build candles.")
+            tick_frame["timestamp"] = pd.to_datetime(tick_frame["timestamp"], utc=True, errors="coerce")
+            tick_frame = tick_frame.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
+            frame = tick_frame.set_index("timestamp")["price"].resample("1min").ohlc().dropna().reset_index()
+            history_note = "Only recent ticks are available. Restart the updated collector to request historical candles."
+        if frame.empty:
+            st.info("No valid candles are available yet.")
             return
-
+        ohlc = frame.set_index("timestamp")[["open", "high", "low", "close"]].resample(
+            candle_interval, origin="start_day"
+        ).agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+        if ohlc.empty:
+            st.info("Waiting for enough price data to build this timeframe.")
+            return
+        last_close = float(ohlc["close"].iloc[-1])
+        label = {"BINANCE:BTCUSDT": "BTC / USDT", "OANDA:XAU_USD": "XAU / USD · Gold"}.get(symbol, symbol)
+        status, detail = market_status(symbol)
+        st.markdown(f"### {label} · {candle_interval}")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Last recorded close", f"${last_close:,.4f}")
+        m2.metric("Candles loaded", f"{len(ohlc):,}")
+        m3.metric("Session", status)
+        if status == "Closed":
+            st.caption(detail)
         fig = go.Figure(data=[go.Candlestick(
-            x=ohlc.index,
-            open=ohlc["open"],
-            high=ohlc["high"],
-            low=ohlc["low"],
-            close=ohlc["close"],
-            name=symbol,
-            increasing=dict(line=dict(color="#20D6C7"), fillcolor="#20D6C7"),
-            decreasing=dict(line=dict(color="#F04452"), fillcolor="#F04452"),
+            x=ohlc.index, open=ohlc["open"], high=ohlc["high"], low=ohlc["low"], close=ohlc["close"],
+            name=label,
+            increasing=dict(line=dict(color="#26A69A", width=1), fillcolor="#26A69A"),
+            decreasing=dict(line=dict(color="#EF5350", width=1), fillcolor="#EF5350"),
+            whiskerwidth=0.65,
+            hovertemplate="<b>%{x|%d %b %Y %H:%M}</b><br>O %{open:.4f}<br>H %{high:.4f}<br>L %{low:.4f}<br>C %{close:.4f}<extra></extra>",
         )])
+        fig.add_hline(y=last_close, line_width=1, line_dash="dot", line_color="#26A69A")
         fig.update_layout(
-            title=f"{symbol} · {candle_interval} candles",
-            margin=dict(l=8, r=8, t=42, b=8),
-            height=500,
-            template="plotly_dark",
-            paper_bgcolor="#0B0F14",
-            plot_bgcolor="#0B0F14",
-            dragmode="pan",
-            uirevision=f"{symbol}-{candle_interval}",
-            xaxis=dict(
-                fixedrange=False, showgrid=True, gridcolor="rgba(150,160,175,0.14)",
-                rangeslider=dict(visible=False), type="date"
-            ),
-            yaxis=dict(
-                side="right", fixedrange=False, showgrid=True,
-                gridcolor="rgba(150,160,175,0.14)"
-            ),
-            hovermode="x unified",
+            height=650, autosize=True, template="plotly_dark",
+            paper_bgcolor="#000000", plot_bgcolor="#000000",
+            margin=dict(l=8, r=72, t=12, b=34), dragmode="pan", hovermode="x unified",
+            showlegend=False, uirevision=f"{symbol}-{candle_interval}",
+            font=dict(color="#D7DCE2", family="Arial, sans-serif", size=12),
+            xaxis=dict(type="date", fixedrange=False, showgrid=True,
+                gridcolor="rgba(110,135,160,0.22)", griddash="dash",
+                rangeslider=dict(visible=False), tickformat="%d %b<br>%H:%M",
+                showline=True, linecolor="#34383d", zeroline=False, automargin=True,
+                rangeselector=dict(bgcolor="#111820", activecolor="#1D6F72",
+                    font=dict(color="#D7DCE2", size=10), buttons=[
+                        dict(count=6, label="6H", step="hour", stepmode="backward"),
+                        dict(count=1, label="1D", step="day", stepmode="backward"),
+                        dict(count=3, label="3D", step="day", stepmode="backward"),
+                        dict(count=7, label="7D", step="day", stepmode="backward"),
+                        dict(step="all", label="ALL")])),
+            yaxis=dict(side="right", fixedrange=False, showgrid=True,
+                gridcolor="rgba(110,135,160,0.22)", griddash="dash",
+                showline=True, linecolor="#34383d", zeroline=False, tickformat=",.2f", automargin=True),
         )
         st.caption(history_note)
-        st.caption("On touchscreens, pinch with two fingers to zoom; drag to pan. Use the chart toolbar to reset the view.")
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config={
-                "scrollZoom": True,
-                "doubleClick": "reset",
-                "displayModeBar": True,
-                "displaylogo": False,
-                "responsive": True,
-                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-            },
-        )
+        st.caption("Drag to move through history. Use 6H / 1D / 3D / 7D / ALL, pinch to zoom on touchscreens, or double-tap to reset.")
+        st.plotly_chart(fig, use_container_width=True, config={
+            "scrollZoom": True, "doubleClick": "reset", "displayModeBar": True,
+            "displaylogo": False, "responsive": True,
+            "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+        })
     except Exception:
-        st.error("Could not render the chart. Check the saved candle data and Redis connection.")
+        st.error("Could not render the chart. Check saved candles and the Redis connection.")
 
 
 # Streamlit's collapsed sidebar becomes the three-bar navigation menu.
