@@ -17,7 +17,7 @@ import websocket
 from dotenv import load_dotenv
 
 load_dotenv()
-WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA", "BINANCE:BTCUSDT"]
+WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA", "BINANCE:BTCUSDT", "OANDA:XAU_USD"]
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 DB_NAME = os.getenv("TRADING_DB_PATH", os.path.join(os.path.dirname(os.path.abspath(__file__)), "trading_bot.db"))
