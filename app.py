@@ -15,7 +15,7 @@ st.set_page_config(
     page_title="Quant Trading Dashboard",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA", "BINANCE:BTCUSDT"]
@@ -140,7 +140,7 @@ def _age_label(age):
 
 @st.fragment(run_every=3)
 def connection_panel():
-    """Show the data path and live health of the collector connection."""
+    """Show a compact, mobile-friendlier view of the data path."""
     now = time.time()
     try:
         redis_ok = bool(r.ping())
@@ -161,14 +161,15 @@ def connection_panel():
     except (TypeError, ValueError):
         message_age = None
 
-    st.subheader("Connection topology")
-    st.caption("Live data path: Finnhub → collector on your computer → Upstash Redis → this dashboard.")
-    c1, a1, c2, a2, c3, a3, c4 = st.columns([1, 0.22, 1, 0.22, 1, 0.22, 1])
-    with c1:
+    st.subheader("Connections")
+    st.caption("Finnhub → your computer → Upstash Redis → dashboard")
+
+    row1 = st.columns(2)
+    with row1[0]:
         with st.container(border=True):
-            st.markdown("**01 · FINNHUB**")
+            st.markdown("**01 · Finnhub feed**")
             if finnhub_state == "connected":
-                st.success("WebSocket connected")
+                st.success("Connected")
             elif finnhub_state == "error":
                 st.error("Feed error")
             elif finnhub_state == "disconnected":
@@ -176,13 +177,11 @@ def connection_panel():
             elif finnhub_state == "connecting":
                 st.info("Connecting…")
             else:
-                st.warning("Not reporting yet")
+                st.warning("Waiting for status")
             st.caption(_age_label(message_age))
-    with a1:
-        st.markdown("<div style='text-align:center;padding-top:2rem;font-size:1.5rem'>→</div>", unsafe_allow_html=True)
-    with c2:
+    with row1[1]:
         with st.container(border=True):
-            st.markdown("**02 · COLLECTOR**")
+            st.markdown("**02 · Collector**")
             if collector_ok:
                 st.success("Worker online")
             elif collector_age is None:
@@ -190,40 +189,39 @@ def connection_panel():
             else:
                 st.error("Heartbeat stale")
             st.caption(_age_label(collector_age))
-    with a2:
-        st.markdown("<div style='text-align:center;padding-top:2rem;font-size:1.5rem'>→</div>", unsafe_allow_html=True)
-    with c3:
+
+    row2 = st.columns(2)
+    with row2[0]:
         with st.container(border=True):
-            st.markdown("**03 · UPSTASH REDIS**")
+            st.markdown("**03 · Upstash Redis**")
             if redis_ok:
-                st.success("Database reachable")
+                st.success("Reachable")
             else:
-                st.error("Database unavailable")
-            st.caption("Shared state + tick stream")
-    with a3:
-        st.markdown("<div style='text-align:center;padding-top:2rem;font-size:1.5rem'>→</div>", unsafe_allow_html=True)
-    with c4:
+                st.error("Unavailable")
+            st.caption("Shared market data")
+    with row2[1]:
         with st.container(border=True):
-            st.markdown("**04 · STREAMLIT UI**")
-            st.success("Dashboard online")
-            st.caption("Refreshing every 3 seconds")
+            st.markdown("**04 · Dashboard**")
+            st.success("Online")
+            st.caption("Auto-refresh: 3 seconds")
 
     prices, ages = load_prices()
-    st.subheader("Live market pulse")
-    cards = st.columns(len(WATCHLIST))
-    for col, symbol in zip(cards, WATCHLIST):
+    st.subheader("Market pulse")
+    pulse_cols = st.columns(2)
+    for index, symbol in enumerate(WATCHLIST):
         label = "BTC / USDT · Binance" if symbol == "BINANCE:BTCUSDT" else symbol
-        with col:
-            price = prices.get(symbol)
-            st.metric(label, f"${price:,.2f}" if price is not None else "Waiting…")
-            age = ages.get(symbol)
-            st.caption(_age_label(age))
-            if age is None:
-                st.warning("No tick yet")
-            elif age > STALE_WARNING_SECONDS:
-                st.warning("Feed may be stale")
-            else:
-                st.success("Receiving ticks")
+        with pulse_cols[index % 2]:
+            with st.container(border=True):
+                price = prices.get(symbol)
+                st.metric(label, f"${price:,.2f}" if price is not None else "Waiting…")
+                age = ages.get(symbol)
+                st.caption(_age_label(age))
+                if age is None:
+                    st.warning("No tick yet")
+                elif age > STALE_WARNING_SECONDS:
+                    st.warning("Feed may be stale")
+                else:
+                    st.success("Receiving ticks")
 
 
 def load_trades():
@@ -307,7 +305,7 @@ def portfolio_panel():
 
 
 @st.fragment(run_every=3)
-def live_chart(symbol):
+def live_chart(symbol, candle_interval):
     try:
         raw = r.lrange(f"ticks:{symbol}", 0, -1)
         if not raw:
@@ -335,7 +333,7 @@ def live_chart(symbol):
             st.info("No valid timestamps are available to chart yet.")
             return
 
-        ohlc = frame.set_index("timestamp")["price"].resample("1min").ohlc().dropna()
+        ohlc = frame.set_index("timestamp")["price"].resample(candle_interval).ohlc().dropna()
         if ohlc.empty:
             st.info("Waiting for enough ticks to build candles.")
             return
@@ -349,7 +347,7 @@ def live_chart(symbol):
             name=symbol,
         )])
         fig.update_layout(
-            title=f"{symbol} — 1-minute candles",
+            title=f"{symbol} — {candle_interval} OHLC candles",
             margin=dict(l=10, r=10, t=35, b=10),
             height=420,
             xaxis_rangeslider_visible=False,
@@ -365,10 +363,22 @@ tab1, tab2 = st.tabs(["Live charts & portfolio", "Audit trail & analytics"])
 with tab1:
     connection_panel()
     selected_symbol = st.selectbox(
-        "Watchlist symbol",
+        "Market",
         WATCHLIST,
         format_func=lambda symbol: "BTC / USDT · Binance" if symbol == "BINANCE:BTCUSDT" else symbol,
     )
+    candle_choice = st.selectbox(
+        "OHLC candle interval",
+        ["1 minute", "5 minutes", "15 minutes", "1 hour"],
+        index=0,
+        help="Builds Open, High, Low and Close candles from ticks currently stored in Redis.",
+    )
+    candle_interval = {
+        "1 minute": "1min",
+        "5 minutes": "5min",
+        "15 minutes": "15min",
+        "1 hour": "1h",
+    }[candle_choice]
     try:
         health = r.get(f"health:last_tick:{selected_symbol}")
         if health is None:
@@ -385,7 +395,7 @@ with tab1:
     except Exception:
         st.warning("Could not read feed health; check the Redis connection.")
 
-    live_chart(selected_symbol)
+    live_chart(selected_symbol, candle_interval)
     st.subheader("Portfolio")
     portfolio_panel()
 
