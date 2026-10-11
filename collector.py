@@ -41,7 +41,7 @@ def init_db(db_path=DB_NAME):
         conn.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id TEXT UNIQUE,
+                event_id TEXT,
                 timestamp TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 action TEXT NOT NULL,
@@ -52,6 +52,11 @@ def init_db(db_path=DB_NAME):
                 reason TEXT NOT NULL
             )
         """)
+        # Migrate databases created by earlier versions that did not have event_id.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+        if "event_id" not in columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN event_id TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_event_id ON trades(event_id)")
         conn.commit()
 
 
@@ -144,8 +149,9 @@ class RealisticPortfolio:
                 entry = float(pos["entry_price"])
                 stop = float(pos["atr_stop"])
                 shares = float(pos["shares"])
-                if not all(math.isfinite(v) for v in (entry, stop, shares)) or shares <= 0 or stop >= entry:
+                if not all(math.isfinite(v) for v in (entry, stop, shares)) or shares <= 0 or entry <= 0 or stop <= 0:
                     return math.inf
+                # A trailing stop above entry protects profit; it contributes zero downside risk.
                 total += shares * max(entry - stop, 0.0)
             return total
 
