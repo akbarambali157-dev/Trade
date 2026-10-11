@@ -895,6 +895,25 @@ elif page == "Bot workbench":
     h1.metric("Collector", r.get("health:collector:status") or "Unknown")
     h2.metric("Market feed", r.get("health:finnhub:status") or "Unknown")
     h3.metric("Last bot decision", r.get("bot:last_decision") or "Not published yet")
+    analysis_symbol = r.get("bot:last_analysis_symbol")
+    if analysis_symbol:
+        analysis_raw = r.get(f"bot:last_analysis:{analysis_symbol}")
+        try:
+            analysis = json.loads(analysis_raw) if analysis_raw else None
+        except (ValueError, TypeError):
+            analysis = None
+        if analysis:
+            st.markdown("**Meridian Brain · latest explanation**")
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("Signal score", f"{analysis.get('score', 0):+d}")
+            metric_cols[1].metric("Trend", str(analysis.get("trend", "unknown")).title())
+            metric_cols[2].metric("Momentum", str(analysis.get("momentum", "unknown")).title())
+            metric_cols[3].metric("RSI state", str(analysis.get("rsi_state", "unknown")).title())
+            st.caption(
+                f"Market: {analysis_symbol} · Estimated ATR volatility: "
+                f"{float(analysis.get('volatility_pct', 0.0)):.2f}% · "
+                f"Reason: {analysis.get('reason', 'No explanation available')}"
+            )
     st.caption("Next development milestones: publish per-symbol decisions/indicator values, add replay/backtesting on historical candles, then evaluate out-of-sample paper results before considering any strategy changes.")
 
 
