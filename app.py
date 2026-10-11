@@ -1,4 +1,5 @@
 """Read-only Streamlit dashboard for the separate paper-trading collector."""
+import hashlib
 import json
 import math
 import os
@@ -7,6 +8,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import fitz
 import plotly.graph_objects as go
 import redis
 import streamlit as st
@@ -358,18 +360,34 @@ def live_chart(symbol, candle_interval):
             name=symbol,
         )])
         fig.update_layout(
-            title=f"{symbol} · {candle_interval} OHLC",
-            margin=dict(l=10, r=10, t=35, b=10),
-            height=420,
-            xaxis_rangeslider_visible=False,
+            title=f"{symbol} · {candle_interval} candles",
+            margin=dict(l=8, r=8, t=42, b=8),
+            height=500,
             template="plotly_dark",
+            dragmode="pan",
+            uirevision=f"{symbol}-{candle_interval}",
+            xaxis=dict(fixedrange=False, showgrid=True, rangeslider=dict(visible=False)),
+            yaxis=dict(fixedrange=False, side="right", fixedrange=False),
+            hovermode="x unified",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.caption("On touchscreens, pinch with two fingers to zoom; spread fingers to zoom out. Drag to pan. Use the chart toolbar to reset the view.")
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config={
+                "scrollZoom": True,
+                "doubleClick": "reset",
+                "displayModeBar": True,
+                "displaylogo": False,
+                "responsive": True,
+                "modeBarButtonsToRemove": ["lasso2d", "select2d"],
+            },
+        )
     except Exception as exc:
         st.error(f"Could not render the chart: {exc}")
 
 
-tab1, tab2 = st.tabs(["Live charts & portfolio", "Audit trail & analytics"])
+tab1, tab2, tab3 = st.tabs(["Live charts & portfolio", "Audit trail & analytics", "PDF learning library"])
 
 with tab1:
     connection_panel()
@@ -444,6 +462,152 @@ with tab2:
             st.dataframe(trades.head(100), use_container_width=True, hide_index=True)
     except Exception as exc:
         st.error(f"Could not load the audit database: {exc}")
+
+
+with tab3:
+    st.subheader("PDF learning library")
+    st.caption(
+        "Upload trading guides, notes, or chart-heavy PDFs. The app extracts selectable text, "
+        "keeps searchable excerpts in Redis, and renders page previews so charts and diagrams "
+        "can be inspected. This is a searchable reference library, not model training."
+    )
+    uploaded_pdf = st.file_uploader(
+        "Choose a PDF",
+        type=["pdf"],
+        key="pdf_knowledge_upload",
+        help="Maximum 25 MB and 200 pages per PDF. Password-protected PDFs are not supported yet.",
+    )
+    if uploaded_pdf is not None:
+        pdf_bytes = uploaded_pdf.getvalue()
+        if len(pdf_bytes) > 25 * 1024 * 1024:
+            st.error("That PDF is larger than 25 MB. Please use a smaller file.")
+        else:
+            digest = hashlib.sha256(pdf_bytes).hexdigest()
+            doc_key = f"knowledge:pdf:{digest}"
+            if st.button("Parse and add to library", type="primary", key="parse_pdf"):
+                try:
+                    with fitz.open(stream=pdf_bytes, filetype="pdf") as pdf:
+                        if len(pdf) > 200:
+                            st.error("This PDF has more than 200 pages. Please split it into smaller files.")
+                        else:
+                            page_records = []
+                            extracted_chars = 0
+                            for page_number, page in enumerate(pdf, start=1):
+                                text_content = page.get_text("text").strip()
+                                extracted_chars += len(text_content)
+                                if text_content:
+                                    # Keep page references attached to every searchable excerpt.
+                                    for start in range(0, len(text_content), 1200):
+                                        excerpt = text_content[max(0, start - 120):start + 1200].strip()
+                                        if excerpt:
+                                            page_records.append({
+                                                "page": page_number,
+                                                "text": excerpt,
+                                            })
+                            document = {
+                                "filename": uploaded_pdf.name,
+                                "sha256": digest,
+                                "pages": len(pdf),
+                                "text_chars": extracted_chars,
+                                "chunks": page_records[:3000],
+                                "saved_at": int(time.time()),
+                            }
+                            r.set(doc_key, json.dumps(document, ensure_ascii=False))
+                            r.sadd("knowledge:pdf_ids", digest)
+                            st.success(
+                                f"Added **{uploaded_pdf.name}** ({len(pdf)} pages). "
+                                f"Extracted {extracted_chars:,} text characters across "
+                                f"{len(document['chunks'])} searchable excerpts."
+                            )
+                            if extracted_chars == 0:
+                                st.warning(
+                                    "No selectable text was found. This may be a scanned PDF; "
+                                    "the page previews below can still show its charts, but OCR "
+                                    "is not enabled yet."
+                                )
+                except Exception:
+                    st.error(
+                        "Could not parse this PDF. It may be damaged, password-protected, "
+                        "or unsupported. Try exporting an unlocked copy and uploading it again."
+                    )
+
+            st.markdown("#### Preview pages and charts")
+            try:
+                with fitz.open(stream=pdf_bytes, filetype="pdf") as preview_pdf:
+                    page_count = len(preview_pdf)
+                    if page_count:
+                        preview_pages = st.multiselect(
+                            "Pages to preview",
+                            options=list(range(1, min(page_count, 200) + 1)),
+                            default=list(range(1, min(page_count, 3) + 1)),
+                            key=f"pdf_preview_{digest}",
+                        )
+                        for page_number in preview_pages[:6]:
+                            page = preview_pdf[page_number - 1]
+                            pix = page.get_pixmap(matrix=fitz.Matrix(1.35, 1.35), alpha=False)
+                            st.image(
+                                pix.tobytes("png"),
+                                caption=f"{uploaded_pdf.name} · page {page_number}",
+                                use_container_width=True,
+                            )
+                            page_text = page.get_text("text").strip()
+                            if page_text:
+                                with st.expander(f"Extracted text · page {page_number}"):
+                                    st.text(page_text[:8000])
+            except Exception:
+                st.info("A page preview could not be generated for this PDF.")
+
+    st.divider()
+    st.markdown("#### Search the saved PDF library")
+    search_query = st.text_input(
+        "Search concepts, terms, or phrases",
+        placeholder="e.g. support and resistance, RSI divergence, risk management",
+        key="pdf_library_search",
+    )
+    try:
+        saved_ids = sorted(r.smembers("knowledge:pdf_ids"))
+        if not saved_ids:
+            st.info("No PDFs have been added yet. Upload and parse one above to start the library.")
+        elif search_query.strip():
+            terms = [term.lower() for term in search_query.split() if len(term) > 1]
+            results = []
+            for saved_id in saved_ids:
+                raw_document = r.get(f"knowledge:pdf:{saved_id}")
+                if not raw_document:
+                    continue
+                try:
+                    document = json.loads(raw_document)
+                except (ValueError, TypeError):
+                    continue
+                for chunk in document.get("chunks", []):
+                    lowered = chunk.get("text", "").lower()
+                    score = sum(lowered.count(term) for term in terms)
+                    if score:
+                        results.append((score, document.get("filename", "PDF"), chunk.get("page", "?"), chunk.get("text", "")))
+            results.sort(key=lambda item: item[0], reverse=True)
+            if results:
+                st.caption(f"Showing up to 20 matching excerpts from {len(saved_ids)} saved PDF(s).")
+                for score, filename, page_number, excerpt in results[:20]:
+                    with st.expander(f"{filename} · page {page_number} · match score {score}"):
+                        st.write(excerpt)
+            else:
+                st.info("No matches found. Try fewer or different keywords.")
+        else:
+            st.caption(f"{len(saved_ids)} PDF(s) saved in the shared Redis library.")
+            for saved_id in saved_ids:
+                raw_document = r.get(f"knowledge:pdf:{saved_id}")
+                if raw_document:
+                    try:
+                        document = json.loads(raw_document)
+                        st.write(
+                            f"**{document.get('filename', 'PDF')}** — "
+                            f"{document.get('pages', '?')} pages, "
+                            f"{document.get('text_chars', 0):,} text characters"
+                        )
+                    except (ValueError, TypeError):
+                        continue
+    except Exception:
+        st.warning("The PDF library could not be read from Redis. Check the Redis connection and available memory.")
 
 st.caption(
     "Market data and paper-trading state are supplied by collector.py, which must "
