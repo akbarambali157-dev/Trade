@@ -488,6 +488,9 @@ div[data-testid="stVerticalBlockBorderWrapper"] { border-color: #253642; border-
 </style>
 """, unsafe_allow_html=True)
 
+def go_to_page(page_name):
+    st.session_state["workspace_page"] = page_name
+
 with st.sidebar:
     st.markdown("## ◈ MERIDIAN")
     st.caption("PAPER TRADING WORKSPACE")
@@ -558,21 +561,15 @@ if page == "Home":
         with st.container(border=True):
             st.markdown("**01 · Charts & price action**")
             st.caption("Candles, timeframes, and market feed status.")
-            if st.button("Open charts →", use_container_width=True):
-                st.session_state["workspace_page"] = "Charts"
-                st.rerun()
+            st.button("Open charts →", use_container_width=True, on_click=go_to_page, args=("Charts",))
         with st.container(border=True):
             st.markdown("**02 · Knowledge library**")
             st.caption("Search excerpts and review uploaded references.")
-            if st.button("Explore knowledge →", use_container_width=True):
-                st.session_state["workspace_page"] = "Knowledge library"
-                st.rerun()
+            st.button("Explore knowledge →", use_container_width=True, on_click=go_to_page, args=("Knowledge library",))
         with st.container(border=True):
             st.markdown("**03 · Bot workbench**")
             st.caption("Inspect the paper strategy and its safety controls.")
-            if st.button("Open bot workbench →", use_container_width=True):
-                st.session_state["workspace_page"] = "Bot workbench"
-                st.rerun()
+            st.button("Open bot workbench →", use_container_width=True, on_click=go_to_page, args=("Bot workbench",))
     st.write("")
     st.markdown("### Market pulse")
     pulse = st.columns(3)
@@ -661,6 +658,31 @@ elif page == "Portfolio & history":
 
 
 elif page == "Knowledge library":
+    st.markdown("## Knowledge library")
+    st.caption("Your saved reference material, searchable excerpts, and chart-heavy PDF previews.")
+    try:
+        knowledge_ids = sorted(r.smembers("knowledge:pdf_ids"))
+        knowledge_docs, knowledge_pages, knowledge_chars, knowledge_chunks = 0, 0, 0, 0
+        for knowledge_id in knowledge_ids:
+            raw_knowledge = r.get(f"knowledge:pdf:{knowledge_id}")
+            if not raw_knowledge:
+                continue
+            try:
+                knowledge_doc = json.loads(raw_knowledge)
+            except (ValueError, TypeError):
+                continue
+            knowledge_docs += 1
+            knowledge_pages += int(knowledge_doc.get("pages", 0) or 0)
+            knowledge_chars += int(knowledge_doc.get("text_chars", 0) or 0)
+            knowledge_chunks += len(knowledge_doc.get("chunks", []))
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Saved PDFs", knowledge_docs)
+        k2.metric("Pages indexed", f"{knowledge_pages:,}")
+        k3.metric("Text characters", f"{knowledge_chars:,}")
+        k4.metric("Searchable excerpts", f"{knowledge_chunks:,}")
+    except Exception:
+        st.info("Knowledge totals are temporarily unavailable.")
+    st.divider()
     st.subheader("PDF learning library")
     st.caption(
         "Upload trading guides, notes, or chart-heavy PDFs. The app extracts selectable text, "
