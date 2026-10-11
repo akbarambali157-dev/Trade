@@ -425,6 +425,19 @@ def run_collector():
                     continue
                 owned = symbol in portfolio.positions
                 decision, reason, atr = engine.process_incoming_tick(symbol, float(price), timestamp, owned)
+                # Dashboard control pauses NEW entries only. Existing positions still get
+                # their protective-stop checks and valid SELL decisions while paused.
+                paper_entries_enabled = client.get("bot:paper_enabled") != "false"
+                if not paper_entries_enabled and decision == "BUY":
+                    decision, reason = "HOLD", "New paper entries paused in dashboard"
+                try:
+                    client.set(
+                        "bot:last_decision",
+                        f"{symbol}: {decision} · {reason[:110]}",
+                        ex=3600,
+                    )
+                except Exception:
+                    log.debug("Could not publish latest strategy decision", exc_info=True)
                 # Check protective stops on every valid tick, including during indicator warm-up.
                 portfolio.process_signal(symbol, float(price), timestamp, decision, reason, atr, latest_prices)
         except Exception:
