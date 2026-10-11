@@ -402,6 +402,9 @@ def run_collector():
             log.info("Subscribed to %s", sym)
             time.sleep(0.05)
 
+    def on_pong(ws, message):
+        log.debug("Received Finnhub WebSocket pong")
+
     def on_error(ws, error):
         set_finnhub_status("error")
         log.error("WebSocket error: %s", error)
@@ -417,8 +420,9 @@ def run_collector():
             set_finnhub_status("connecting")
             log.info("Connecting to Finnhub")
             ws = websocket.WebSocketApp(socket_url, on_open=on_open, on_message=on_message,
-                                        on_error=on_error, on_close=on_close)
-            ws.run_forever(ping_interval=30, ping_timeout=10)
+                                        on_error=on_error, on_close=on_close, on_pong=on_pong)
+            # Allow more time for a pong on slower or mobile networks.
+            ws.run_forever(ping_interval=45, ping_timeout=20)
         except Exception:
             log.exception("Collector connection failed")
         log.info("Reconnecting in %s seconds", retry_delay)
