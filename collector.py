@@ -433,8 +433,15 @@ class RealisticPortfolio:
             if isinstance(current_atr, (int, float)) and math.isfinite(current_atr) and current_atr > 0:
                 proposed = current_price - current_atr * self.atr_multiplier
                 if proposed > stop:
-                    pos["atr_stop"] = proposed
-                    self.save_state()
+                    # Persist a candidate snapshot before replacing in-memory state.
+                    new_positions = json.loads(json.dumps(self.positions))
+                    new_positions[symbol]["atr_stop"] = proposed
+                    with sqlite3.connect(self.db_path, timeout=10) as conn:
+                        conn.execute("PRAGMA busy_timeout=10000")
+                        self._write_state_snapshot(conn, self.total_cash, new_positions)
+                        conn.commit()
+                    self.positions = new_positions
+                    self._sync_redis_state()
             return False
 
     def process_signal(self, symbol, price, timestamp, decision, reason, current_atr, latest_prices=None):
