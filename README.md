@@ -84,3 +84,25 @@ The dashboard includes a **PDF learning library** tab. Upload a PDF (up to 25 MB
 - Redis storage is shared with the dashboard and collector, so monitor your Redis plan's memory limits and only upload material you are allowed to use.
 
 The chart supports touch pinch-to-zoom on compatible mobile browsers, drag-to-pan, toolbar controls, and double-click reset. Gesture behavior can vary slightly by browser/device.
+
+
+## Dukascopy historical-data research importer
+
+`historical_data.py` downloads Dukascopy XAU/USD candles through the `dukascopy-cli` command-line package and saves a validated, persistent CSV archive. It is intentionally separate from the live collector and Redis rolling candle list.
+
+Requirements:
+- Python dependencies from `requirements.txt`
+- Node.js and npm installed and available in the terminal (the script uses `npx`)
+- Network access to the data source
+
+Example on Windows PowerShell:
+
+```powershell
+python historical_data.py --from 2025-01-01 --to 2025-01-08 --timeframe m1
+```
+
+The end date is exclusive. Supported timeframes are `m1`, `m5`, `m15`, `m30`, `h1`, `h4`, and `d1`. By default the archive is written to `data/historical/xauusd_m1.csv`; specify `--output` to choose another path. The filename remains the same for other timeframes unless a different output path is supplied.
+
+The importer normalizes timestamps to UTC, validates OHLC values, deduplicates candles, and preserves existing archive rows when a timestamp already exists. It does not yet connect this archive to the dashboard chart or strategy engine; that is a separate integration step. Validate downloaded date coverage, gaps, and source-price differences before using data in offline simulations.
+
+This is for educational historical-data analysis and paper simulations only. The project does not place real orders, and the strategy has not been shown to be profitable.
