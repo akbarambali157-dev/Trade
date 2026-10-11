@@ -1,4 +1,4 @@
-"""Read-only Streamlit dashboard for the separate paper-trading collector."""
+"""Streamlit dashboard for monitoring the separate paper-trading collector."""
 import hashlib
 import json
 import math
@@ -49,7 +49,7 @@ STALE_POSITION_SECONDS = 120
 
 st.title("Quant Trading Dashboard")
 st.caption(
-    "SIMULATION ONLY · This read-only dashboard does not place brokerage orders "
+    "SIMULATION ONLY · This dashboard does not place brokerage orders "
     "or use real money."
 )
 
@@ -109,28 +109,53 @@ def load_portfolio():
 
 
 def load_prices():
+    """Read latest prices and calculate age, with a tick-timestamp fallback.
+
+    The collector's health:last_tick keys expire after one hour, while its tick
+    lists may live longer. Falling back to the timestamp inside the last saved
+    tick prevents old prices from being mislabeled as having no age information.
+    """
     prices, ages = {}, {}
+    now = time.time()
     for symbol in WATCHLIST:
         raw = r.lrange(f"ticks:{symbol}", -1, -1)
         health = r.get(f"health:last_tick:{symbol}")
+        tick = None
+
         if raw:
             try:
-                tick = json.loads(raw[0])
-                price = float(tick["price"])
+                candidate = json.loads(raw[0])
+                price = float(candidate["price"])
                 if math.isfinite(price) and price > 0:
                     prices[symbol] = price
+                    tick = candidate
             except (ValueError, TypeError, KeyError, json.JSONDecodeError):
                 # Ignore a malformed latest tick rather than breaking the dashboard.
                 pass
+
+        received_at = None
         if health:
             try:
-                received_at = float(health)
-                if math.isfinite(received_at) and received_at > 0:
-                    ages[symbol] = max(0.0, time.time() - received_at)
+                parsed_health = float(health)
+                if math.isfinite(parsed_health) and parsed_health > 0:
+                    received_at = parsed_health
             except (ValueError, TypeError):
                 pass
-    return prices, ages
 
+        # The health key records local receipt time. If it expired or is invalid,
+        # use the tick's UTC event timestamp to retain a meaningful staleness label.
+        if received_at is None and tick:
+            try:
+                event_time = pd.to_datetime(tick.get("timestamp"), utc=True, errors="coerce")
+                if not pd.isna(event_time):
+                    received_at = event_time.timestamp()
+            except (TypeError, ValueError, OverflowError):
+                pass
+
+        if received_at is not None:
+            ages[symbol] = max(0.0, now - received_at)
+
+    return prices, ages
 
 
 def market_status(symbol):
@@ -905,7 +930,11 @@ elif page == "Bot workbench":
         if analysis:
             st.markdown("**Meridian Brain · latest explanation**")
             metric_cols = st.columns(4)
-            metric_cols[0].metric("Signal score", f"{analysis.get('score', 0):+d}")
+            try:
+                score_value = int(analysis.get("score", 0))
+            except (TypeError, ValueError, OverflowError):
+                score_value = 0
+            metric_cols[0].metric("Signal score", f"{score_value:+d}")
             metric_cols[1].metric("Trend", str(analysis.get("trend", "unknown")).title())
             metric_cols[2].metric("Momentum", str(analysis.get("momentum", "unknown")).title())
             metric_cols[3].metric("RSI state", str(analysis.get("rsi_state", "unknown")).title())
