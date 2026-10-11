@@ -18,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA", "BINANCE:BTCUSDT"]
+WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVDA", "BINANCE:BTCUSDT", "OANDA:XAU_USD"]
 
 
 def setting(name, default=None):
@@ -206,10 +206,16 @@ def connection_panel():
             st.caption("Auto-refresh: 3 seconds")
 
     prices, ages = load_prices()
-    st.subheader("Market pulse")
+    st.subheader("Markets")
+    st.caption("Tap a market card to open its chart below.")
     pulse_cols = st.columns(2)
     for index, symbol in enumerate(WATCHLIST):
-        label = "BTC / USDT · Binance" if symbol == "BINANCE:BTCUSDT" else symbol
+        if symbol == "BINANCE:BTCUSDT":
+            label = "BTC / USDT"
+        elif symbol == "OANDA:XAU_USD":
+            label = "XAU / USD · Gold"
+        else:
+            label = symbol
         with pulse_cols[index % 2]:
             with st.container(border=True):
                 price = prices.get(symbol)
@@ -217,11 +223,16 @@ def connection_panel():
                 age = ages.get(symbol)
                 st.caption(_age_label(age))
                 if age is None:
-                    st.warning("No tick yet")
+                    st.caption("No tick yet")
                 elif age > STALE_WARNING_SECONDS:
-                    st.warning("Feed may be stale")
+                    st.caption("Feed may be stale")
                 else:
-                    st.success("Receiving ticks")
+                    st.caption("● Live feed")
+                selected = st.session_state.get("selected_market", WATCHLIST[0]) == symbol
+                button_label = "✓ Chart selected" if selected else "View chart →"
+                if st.button(button_label, key=f"market_{symbol}", use_container_width=True):
+                    st.session_state["selected_market"] = symbol
+                    st.rerun()
 
 
 def load_trades():
@@ -347,7 +358,7 @@ def live_chart(symbol, candle_interval):
             name=symbol,
         )])
         fig.update_layout(
-            title=f"{symbol} — {candle_interval} OHLC candles",
+            title=f"{symbol} · {candle_interval} OHLC",
             margin=dict(l=10, r=10, t=35, b=10),
             height=420,
             xaxis_rangeslider_visible=False,
@@ -362,23 +373,29 @@ tab1, tab2 = st.tabs(["Live charts & portfolio", "Audit trail & analytics"])
 
 with tab1:
     connection_panel()
-    selected_symbol = st.selectbox(
-        "Market",
-        WATCHLIST,
-        format_func=lambda symbol: "BTC / USDT · Binance" if symbol == "BINANCE:BTCUSDT" else symbol,
-    )
-    candle_choice = st.selectbox(
-        "OHLC candle interval",
-        ["1 minute", "5 minutes", "15 minutes", "1 hour"],
+    selected_symbol = st.session_state.get("selected_market", WATCHLIST[0])
+    selected_label = {
+        "BINANCE:BTCUSDT": "BTC / USDT · Binance",
+        "OANDA:XAU_USD": "XAU / USD · Gold",
+    }.get(selected_symbol, selected_symbol)
+    st.subheader(f"{selected_label} chart")
+    timeframe_choice = st.radio(
+        "Timeframe",
+        ["1m", "5m", "15m", "30m", "1h", "4h", "1D"],
         index=0,
-        help="Builds Open, High, Low and Close candles from ticks currently stored in Redis.",
+        horizontal=True,
+        key="chart_timeframe",
+        help="Candles are built from ticks currently retained in Redis.",
     )
     candle_interval = {
-        "1 minute": "1min",
-        "5 minutes": "5min",
-        "15 minutes": "15min",
-        "1 hour": "1h",
-    }[candle_choice]
+        "1m": "1min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
+        "1h": "1h",
+        "4h": "4h",
+        "1D": "1D",
+    }[timeframe_choice]
     try:
         health = r.get(f"health:last_tick:{selected_symbol}")
         if health is None:
