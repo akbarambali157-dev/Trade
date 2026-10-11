@@ -417,6 +417,18 @@ def live_chart(symbol, candle_interval):
                     "Only recent live ticks are available so far. The chart will accumulate "
                     "one-minute candles as new ticks arrive; older history is not being fabricated."
                 )
+        history_status = r.get(f"history:status:{symbol}") or "not_loaded"
+        if history_status.startswith("permission_denied"):
+            history_note = (
+                "Finnhub denied historical backfill for this symbol on the current account. "
+                "This chart therefore shows only candles accumulated locally from live ticks; "
+                "longer timeframes are aggregated from that available history."
+            )
+        elif history_status.startswith("http_error:"):
+            history_note = (
+                f"Historical backfill returned {history_status}. The chart uses locally saved "
+                "candles and will continue accumulating live data."
+            )
         if frame.empty:
             st.info("No valid candles are available yet.")
             return
