@@ -378,7 +378,10 @@ def live_chart(symbol, candle_interval):
                 frame[col] = pd.to_numeric(frame[col], errors="coerce")
             frame = frame.dropna(subset=["timestamp", "open", "high", "low", "close"])
             frame = frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
-            history_note = "Historical OHLC candles from Redis, merged with recent live candles."
+            history_note = (
+                "Saved OHLC candles from Redis, including locally accumulated live candles. "
+                "The collector preserves existing history when historical API access is unavailable."
+            )
         else:
             raw_ticks = r.lrange(f"ticks:{symbol}", 0, -1)
             ticks = []
@@ -397,10 +400,28 @@ def live_chart(symbol, candle_interval):
             tick_frame["timestamp"] = pd.to_datetime(tick_frame["timestamp"], utc=True, errors="coerce")
             tick_frame = tick_frame.dropna(subset=["timestamp", "price"]).sort_values("timestamp")
             frame = tick_frame.set_index("timestamp")["price"].resample("1min").ohlc().dropna().reset_index()
-            history_note = "Only recent ticks are available. Restart the updated collector to request historical candles."
+            history_status = r.get(f"history:status:{symbol}") or "not_loaded"
+            if history_status.startswith("permission_denied"):
+                history_note = (
+                    "Historical candles are unavailable because Finnhub denied this endpoint "
+                    "for the current account. The chart below uses only recent live ticks; "
+                    "it will build more history as new data arrives."
+                )
+            elif history_status.startswith("http_error:"):
+                history_note = (
+                    f"Historical request failed ({history_status}). The chart uses recent live ticks "
+                    "and will accumulate more candles while the collector runs."
+                )
+            else:
+                history_note = (
+                    "Only recent live ticks are available so far. The chart will accumulate "
+                    "one-minute candles as new ticks arrive; older history is not being fabricated."
+                )
         if frame.empty:
             st.info("No valid candles are available yet.")
             return
+        # Longer chart timeframes are aggregated locally from the one-minute candles.
+        # This does not imply that historical data exists beyond the records in Redis.
         ohlc = frame.set_index("timestamp")[["open", "high", "low", "close"]].resample(
             candle_interval, origin="start_day"
         ).agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
