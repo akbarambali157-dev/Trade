@@ -118,6 +118,54 @@ def test_incomplete_portfolio_state_fails_closed(tmp_path):
         RealisticPortfolio(redis_client=client, db_path=str(tmp_path / "bad.db"))
 
 
+def test_trade_event_and_state_snapshot_are_idempotent(portfolio):
+    bot, client, db = portfolio
+    position = {
+        "shares": 2.0, "entry_price": 100.0, "atr_stop": 95.0,
+        "entry_commission": 0.1,
+    }
+    args = ("2026-01-01T00:00:00+00:00", "MSFT", "BUY", 100.0, 2.0,
+            0.0, "0.00%", "test entry")
+
+    assert bot.commit_trade_state(*args, 9799.9, {"MSFT": position}) is True
+    assert bot.total_cash == pytest.approx(9799.9)
+    assert "MSFT" in bot.positions
+
+    # Replaying the same event must not apply the balance change twice.
+    assert bot.commit_trade_state(*args, 9599.8, {}) is False
+    assert bot.total_cash == pytest.approx(9799.9)
+    assert bot.positions["MSFT"]["shares"] == pytest.approx(2.0)
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
+        state = conn.execute(
+            "SELECT cash, positions_json FROM portfolio_state WHERE id=1"
+        ).fetchone()
+    assert state[0] == pytest.approx(9799.9)
+    assert json.loads(state[1])["MSFT"]["shares"] == pytest.approx(2.0)
+
+
+def test_restart_repairs_stale_redis_from_durable_sqlite_snapshot(portfolio):
+    bot, client, _ = portfolio
+    position = {
+        "shares": 1.0, "entry_price": 50.0, "atr_stop": 45.0,
+        "entry_commission": 0.025,
+    }
+    args = ("2026-01-01T00:00:00+00:00", "AAPL", "BUY", 50.0, 1.0,
+            0.0, "0.00%", "test entry")
+    assert bot.commit_trade_state(*args, 9949.975, {"AAPL": position}) is True
+
+    # Simulate Redis being stale after the durable commit.
+    client.set("portfolio:cash", "1")
+    client.set("portfolio:positions", "{}")
+    restored = RealisticPortfolio(redis_client=client, db_path=bot.db_path)
+
+    assert restored.total_cash == pytest.approx(9949.975)
+    assert restored.positions["AAPL"]["shares"] == pytest.approx(1.0)
+    assert float(client.get("portfolio:cash")) == pytest.approx(9949.975)
+    assert json.loads(client.get("portfolio:positions"))["AAPL"]["shares"] == pytest.approx(1.0)
+
+
 def test_cash_sizing_includes_commission(portfolio):
     bot, client, _ = portfolio
     # Make all market data fresh for this symbol.
